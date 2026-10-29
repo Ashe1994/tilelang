@@ -1,0 +1,492 @@
+"""MLA decode forward kernel on Ascend 950 -- flash-decoding (split-KV) variant.
+
+Same operator as ``example_mla_decode.py``::
+
+    O[b,h,:] = sum_s softmax( (Q[b,h,:]KV[b,s,:] + Q_pe[b,h,:]K_pe[b,s,:]) * scale ) * KV[b,s,:]
+
+The ``num_split == 1`` kernel partitions work as ``grid = batch * heads / block_H``,
+so ``batch=1, heads=128`` runs on a single AI core and leaves the other cores idle
+(measured upstream: latency is flat from batch 1 to batch 16). This variant splits
+the KV axis instead, ``grid = batch * heads / block_H * num_split``, and merges the
+partials in a second, pure-vector kernel:
+
+    phase 1 (Cube cores): each core owns one KV range of one head block and
+        produces an unnormalised partial output plus its log-sum-exp:
+            O_p[s] = sum_{kv in range} exp(x - m_s) * V ,  lse_s = m_s + log(l_s)
+    phase 2 (Vector cores): combine splits with softmax weights over split axis:
+            w_s = exp(lse_s - max_s lse_s)
+            O = (sum_s w_s * O_p[s]) / (sum_s w_s)
+
+Why two kernels instead of one: a cross-core barrier would need every core to
+reach it, which serialises the merge behind the slowest split and still needs the
+partials to round-trip through GM. Two launches overlap nothing but cost one
+extra kernel boundary.
+
+Phase 1 writes ``O_partial`` as float32 -- the partials are unnormalised, so an
+fp16 round trip would lose accuracy -- and ``ML``, a
+``[num_split, batch, heads, ML_WIDTH]`` float32 tensor whose column 0 holds
+``lse``. The wide row exists because the partial write reuses ``T.dual_copy``,
+whose UB->GM path merges the two AIV halves of the M axis through one DMA; a
+1-wide region is not a useful transfer shape, and 32 fp32 lanes (128 B) keep the
+destination row aligned.
+
+Every platform constraint of the ``num_split == 1`` kernel still applies
+(``block_H == 128``, NT-only L1 GEMM, V transposed into one independent L1 buffer
+per output-column chunk, ``kv_len`` any value >= ``block_N``). Two extra
+constraints: the effective split count is ``min(num_split, kv blocks)`` reduced
+until it divides the KV block count, and each split runs at least one KV block.
+"""
+
+import tilelang
+import tilelang.ascend.language as T
+
+ML_WIDTH = 32
+
+
+def pick_tiling(kv_len, dim, block_N=None, chunk_d=None, merge_chunk_d=None):
+    """Pick the measured-best tiling for a shape.
+
+    block_N=128 halves the per-KV-element vector traffic (one rescale/accumulate
+    pass per 128 columns instead of per 64), but the score tile grows to 32 KiB
+    and the kernel needs kv_len >= block_N. chunk_d=64 keeps the L0C/UB budget
+    inside the envelope at block_N=128; the merge tiles columns independently, so
+    it keeps 128-wide DMAs.
+    """
+    if block_N is None:
+        block_N = 128 if kv_len >= 128 else 64
+    if chunk_d is None:
+        chunk_d = 64 if block_N >= 128 else 128
+    if merge_chunk_d is None:
+        merge_chunk_d = 128 if dim % 128 == 0 else chunk_d
+    assert dim % chunk_d == 0, "dim must be a multiple of chunk_d"
+    assert dim % merge_chunk_d == 0, "dim must be a multiple of merge_chunk_d"
+    return block_N, chunk_d, merge_chunk_d
+
+
+def effective_split(kv_len, block_N, num_split):
+    """Split count actually used: bounded by the KV block count, must divide it."""
+    kv_blocks = (kv_len + block_N - 1) // block_N
+    ns = min(num_split, kv_blocks)
+    while kv_blocks % ns != 0:
+        ns -= 1
+    return ns
+
+
+def mla_decode_splitk_fwd(
+    batch,
+    heads,
+    kv_len,
+    dim,
+    pe_dim,
+    block_H=128,
+    block_N=64,
+    chunk_d=128,
+    softmax_scale=None,
+    num_split=8,
+    threads=1024,
+    num_stages=2,
+    fuse_qk=True,
+    fuse_rescale=True,
+):
+    """Phase 1: per-split partial attention output + log-sum-exp.
+
+    ``fuse_qk`` accumulates the pe-half and content-half QK GEMMs in one L0C
+    buffer (``clear_accum=False`` on the second) instead of producing two score
+    tiles and adding them in UB: one fewer L0C->UB transfer per KV block and one
+    fewer score buffer (16 KiB at block_N=64, 32 KiB at block_N=128).
+
+    ``fuse_rescale`` folds the per-block ``o_ub *= alpha`` pass into the PV
+    accumulate (``o = o*alpha + pv``), halving the accumulator traffic per block.
+    """
+    scale = float(softmax_scale) if softmax_scale is not None else (dim + pe_dim) ** -0.5
+    dtype = "float16"
+    accum_dtype = "float32"
+
+    ROWS = block_H // 2
+    NUM_M_TILES = heads // block_H
+    KV_BLOCKS = (kv_len + block_N - 1) // block_N
+    NUM_DC = dim // chunk_d
+    NS = effective_split(kv_len, block_N, num_split)
+    BPS = KV_BLOCKS // NS
+    NUM_BLOCKS = batch * NUM_M_TILES * NS
+
+    assert block_H == 128, "block_H must be 128 (T.dual_copy L0C->UB requires M=128)"
+    assert heads % block_H == 0, "heads must be a multiple of block_H"
+    assert dim % chunk_d == 0, "dim must be a multiple of chunk_d"
+    assert kv_len >= block_N, "kv_len must be at least block_N"
+    assert pe_dim % 16 == 0 and dim % 16 == 0
+
+    @T.prim_func
+    def main(
+        Q: T.Tensor((batch, heads, dim), dtype),
+        Q_pe: T.Tensor((batch, heads, pe_dim), dtype),
+        KV: T.Tensor((batch, kv_len, dim), dtype),
+        K_pe: T.Tensor((batch, kv_len, pe_dim), dtype),
+        O_partial: T.Tensor((NS, batch, heads, dim), accum_dtype),
+        ML: T.Tensor((NS, batch, heads, ML_WIDTH), accum_dtype),
+    ):
+        with T.Kernel(NUM_BLOCKS) as bx:
+            b = bx // (NUM_M_TILES * NS)
+            rem = bx % (NUM_M_TILES * NS)
+            h0 = (rem // NS) * block_H
+            sid = rem % NS
+
+            # ------------------------------ L1 ------------------------------
+            q_l1 = T.alloc_l1((block_H, dim), dtype)
+            q_pe_l1 = T.alloc_l1((block_H, pe_dim), dtype)
+            k_l1 = T.alloc_l1((block_N, dim), dtype)
+            k_pe_l1 = T.alloc_l1((block_N, pe_dim), dtype)
+            p_l1 = T.alloc_l1((block_H, block_N), dtype)
+            # V^T per output-column chunk; independent buffers are required
+            # because a dynamic L1 row slice is not a valid GEMM B operand.
+            v_l1 = [T.alloc_l1((chunk_d, block_N), dtype) for _ in range(NUM_DC)]
+
+            # ------------------------------ L0C -----------------------------
+            s_l0c = T.alloc_l0c((block_H, block_N), accum_dtype)
+            o_l0c = T.alloc_l0c((block_H, chunk_d), accum_dtype)
+
+            # ------------------------------ UB ------------------------------
+            s_ub = T.alloc_shared((ROWS, block_N), accum_dtype)
+            if not fuse_qk:
+                s_pe_ub = T.alloc_shared((ROWS, block_N), accum_dtype)
+            p_ub = T.alloc_shared((ROWS, block_N), dtype)
+            # One contiguous accumulator per output-column chunk: the write-back
+            # then reuses the same T.dual_copy shape as the num_split=1 kernel.
+            o_ub = [T.alloc_shared((ROWS, chunk_d), accum_dtype) for _ in range(NUM_DC)]
+            o_tmp_ub = T.alloc_shared((ROWS, chunk_d), accum_dtype)
+            ml_ub = T.alloc_shared((ROWS, ML_WIDTH), accum_dtype)
+
+            m_ub = T.alloc_shared((ROWS,), accum_dtype)
+            l_ub = T.alloc_shared((ROWS,), accum_dtype)
+            alpha_ub = T.alloc_shared((ROWS,), accum_dtype)
+
+            T.copy(Q[b, h0:h0 + block_H, 0:dim], q_l1[0:block_H, 0:dim])
+            T.copy(Q_pe[b, h0:h0 + block_H, 0:pe_dim], q_pe_l1[0:block_H, 0:pe_dim])
+
+            with T.SimtVF(threads=threads):
+                for r in T.Parallel(ROWS):
+                    m_ub[r] = -T.infinity(accum_dtype)
+                    l_ub[r] = 0.0
+                for ob in o_ub:
+                    for r, c in T.Parallel(ROWS, chunk_d):
+                        ob[r, c] = 0.0
+
+            for kv_local in T.Pipelined(BPS, num_stages=num_stages):
+                kv = sid * BPS + kv_local
+                base = kv * block_N
+                start = T.min(base, kv_len - block_N)
+                lo = base - start
+                hi = kv_len - start
+
+                T.copy(KV[b, start:start + block_N, 0:dim], k_l1[0:block_N, 0:dim])
+                T.copy(K_pe[b, start:start + block_N, 0:pe_dim], k_pe_l1[0:block_N, 0:pe_dim])
+                for i, vb in enumerate(v_l1):
+                    T.copy(
+                        KV[b, start:start + block_N, i * chunk_d:(i + 1) * chunk_d],
+                        vb[0:chunk_d, 0:block_N],
+                        transpose=True,
+                    )
+
+                # QK: position-encoding half first, then content half, reusing one L0C.
+                T.gemm(
+                    q_pe_l1[0:block_H, 0:pe_dim],
+                    k_pe_l1[0:block_N, 0:pe_dim],
+                    s_l0c,
+                    transpose_B=True,
+                    clear_accum=True,
+                )
+                if not fuse_qk:
+                    T.dual_copy(s_l0c, s_pe_ub[0:ROWS, 0:block_N])
+                # Accumulate the content half straight into the same L0C, so the
+                # two halves never need two score tiles in UB.
+                T.gemm(
+                    q_l1[0:block_H, 0:dim],
+                    k_l1[0:block_N, 0:dim],
+                    s_l0c,
+                    transpose_B=True,
+                    clear_accum=not fuse_qk,
+                )
+                T.dual_copy(s_l0c, s_ub[0:ROWS, 0:block_N])
+
+                with T.SimtVF(threads=threads):
+                    for r, c in T.Parallel(ROWS, block_N):
+                        if fuse_qk:
+                            scaled = s_ub[r, c] * scale
+                        else:
+                            scaled = (s_ub[r, c] + s_pe_ub[r, c]) * scale
+                        s_ub[r, c] = T.if_then_else(
+                            c >= lo,
+                            T.if_then_else(c < hi, scaled, -T.infinity(accum_dtype)),
+                            -T.infinity(accum_dtype),
+                        )
+
+                    red_max = T.alloc_reducer((ROWS,), accum_dtype, op="max")
+                    T.reducer_init(red_max)
+                    for r, c in T.Parallel(ROWS, block_N):
+                        T.reducer_update(red_max[r], s_ub[r, c])
+                    tile_max = T.alloc_fragment((ROWS,), accum_dtype)
+                    T.finalize_reducer(red_max, tile_max)
+
+                    for r in T.Parallel(ROWS):
+                        new_m = T.max(m_ub[r], tile_max[r])
+                        alpha_ub[r] = T.exp(m_ub[r] - new_m)
+                        m_ub[r] = new_m
+
+                    # exp and the fp16 cast in one pass (the separate p_ub = s_ub
+                    # copy was a full extra sweep of the score tile)
+                    for r, c in T.Parallel(ROWS, block_N):
+                        e = T.exp(s_ub[r, c] - m_ub[r])
+                        s_ub[r, c] = e
+                        p_ub[r, c] = e
+
+                    red_sum = T.alloc_reducer((ROWS,), accum_dtype, op="sum")
+                    T.reducer_init(red_sum)
+                    for r, c in T.Parallel(ROWS, block_N):
+                        T.reducer_update(red_sum[r], s_ub[r, c])
+                    tile_sum = T.alloc_fragment((ROWS,), accum_dtype)
+                    T.finalize_reducer(red_sum, tile_sum)
+
+                    for r in T.Parallel(ROWS):
+                        l_ub[r] = l_ub[r] * alpha_ub[r] + tile_sum[r]
+
+                    if not fuse_rescale:
+                        for ob in o_ub:
+                            for r, c in T.Parallel(ROWS, chunk_d):
+                                ob[r, c] = ob[r, c] * alpha_ub[r]
+
+                T.dual_copy(p_ub[0:ROWS, 0:block_N], p_l1[0:block_H, 0:block_N])
+
+                # P·V over output-column chunks, unrolled at Python level.
+                for i, vb in enumerate(v_l1):
+                    T.gemm(p_l1[0:block_H, 0:block_N], vb, o_l0c, transpose_B=True, clear_accum=True)
+                    T.dual_copy(o_l0c, o_tmp_ub[0:ROWS, 0:chunk_d])
+                    with T.SimtVF(threads=threads):
+                        if fuse_rescale:
+                            # One pass instead of "rescale all chunks, then add".
+                            for r, c in T.Parallel(ROWS, chunk_d):
+                                o_ub[i][r, c] = o_ub[i][r, c] * alpha_ub[r] + o_tmp_ub[r, c]
+                        else:
+                            for r, c in T.Parallel(ROWS, chunk_d):
+                                o_ub[i][r, c] = o_ub[i][r, c] + o_tmp_ub[r, c]
+
+            # ---- publish partials: per-split output + row log-sum-exp ----
+            # Normalise inside the split so the merge is the standard
+            # flash-decoding weighted average over log-sum-exp values; an
+            # unnormalised partial would need m_s as a second scalar.
+            with T.SimtVF(threads=threads):
+                for ob in o_ub:
+                    for r, c in T.Parallel(ROWS, chunk_d):
+                        ob[r, c] = ob[r, c] / l_ub[r]
+
+            # enumerate() keeps this a Python-level unroll; a `for i in range(N)`
+            # would become a TIR loop whose index cannot subscript a Python list.
+            for i, ob in enumerate(o_ub):
+                T.dual_copy(
+                    ob[0:ROWS, 0:chunk_d],
+                    O_partial[sid, b, h0:h0 + block_H, i * chunk_d:(i + 1) * chunk_d],
+                )
+
+            with T.SimtVF(threads=threads):
+                for r, c in T.Parallel(ROWS, ML_WIDTH):
+                    ml_ub[r, c] = 0.0
+                for r in T.Parallel(ROWS):
+                    ml_ub[r, 0] = m_ub[r] + T.log(l_ub[r])
+            T.dual_copy(ml_ub[0:ROWS, 0:ML_WIDTH], ML[sid, b, h0:h0 + block_H, 0:ML_WIDTH])
+
+    return main
+
+
+def mla_decode_merge(
+    batch,
+    heads,
+    kv_len,
+    dim,
+    pe_dim,
+    block_H=128,
+    block_N=64,
+    chunk_d=128,
+    num_split=8,
+    threads=256,
+    rows_per_block=16,
+    num_stages=4,
+    ns_explicit=None,
+    ml_width=ML_WIDTH,
+):
+    """Phase 2: combine the per-split partials into the final fp16 output.
+
+    ``rows_per_block`` splits the 128-row head block across more blocks. With the
+    default (one block per column chunk) the merge runs on ``heads/block_H *
+    dim/chunk_d`` blocks only -- 4 for the MLA decode shape -- so the split loop
+    was latency bound rather than bandwidth bound.
+
+    ``num_stages`` pipelines that split loop, overlapping the next split's DMA
+    with the current split's vector accumulate.
+    """
+    dtype = "float16"
+    accum_dtype = "float32"
+
+    RP = block_H if rows_per_block is None else rows_per_block
+    assert block_H % RP == 0, "block_H must be a multiple of rows_per_block"
+    RSPLIT = block_H // RP
+    NUM_M_TILES = heads // block_H
+    NUM_DC = dim // chunk_d
+    # ns_explicit bypasses the kv_len-derived split count: the paged kernel has a
+    # runtime sequence length, so its split count is fixed by the caller instead.
+    NS = effective_split(kv_len, block_N, num_split) if ns_explicit is None else ns_explicit
+    NUM_BLOCKS = batch * NUM_M_TILES * NUM_DC * RSPLIT
+
+    @T.prim_func
+    def merge_main(
+        O_partial: T.Tensor((NS, batch, heads, dim), accum_dtype),
+        ML: T.Tensor((NS, batch, heads, ml_width), accum_dtype),
+        O: T.Tensor((batch, heads, dim), dtype),
+    ):
+        with T.Kernel(NUM_BLOCKS) as bx:
+            b = bx // (NUM_M_TILES * NUM_DC * RSPLIT)
+            rem = bx % (NUM_M_TILES * NUM_DC * RSPLIT)
+            h0 = (rem // (NUM_DC * RSPLIT)) * block_H + (rem % RSPLIT) * RP
+            dc = (rem // RSPLIT) % NUM_DC
+
+            acc = T.alloc_shared((RP, chunk_d), accum_dtype)
+            tmp = T.alloc_shared((RP, chunk_d), accum_dtype)
+            out_h = T.alloc_shared((RP, chunk_d), dtype)
+            ml = T.alloc_shared((RP, ml_width), accum_dtype)
+            # The split axis is a TIR loop, not a Python unroll: unrolling one
+            # copy+sync group per split pushes the scheduler past the dav-3510
+            # intra-core flag pool ("total spilled mutex slots (46) exceed 32")
+            # once num_split reaches 16.
+            lse = T.alloc_shared((NS, RP), accum_dtype)
+            wts = T.alloc_shared((NS, RP), accum_dtype)
+            row_max = T.alloc_shared((RP,), accum_dtype)
+            row_sum = T.alloc_shared((RP,), accum_dtype)
+
+            # gather the per-split log-sum-exp and track the running maximum
+            with T.SimtVF(threads=threads):
+                for r in T.Parallel(RP):
+                    row_max[r] = -T.infinity(accum_dtype)
+            if num_stages > 1:
+                for i in T.Pipelined(NS, num_stages=num_stages):
+                    T.copy(ML[i, b, h0:h0 + RP, 0:ml_width], ml)
+                    with T.SimtVF(threads=threads):
+                        for r in T.Parallel(RP):
+                            lse[i, r] = ml[r, 0]
+                            row_max[r] = T.max(row_max[r], ml[r, 0])
+            else:
+                for i in T.serial(NS):
+                    T.copy(ML[i, b, h0:h0 + RP, 0:ml_width], ml)
+                    with T.SimtVF(threads=threads):
+                        for r in T.Parallel(RP):
+                            lse[i, r] = ml[r, 0]
+                            row_max[r] = T.max(row_max[r], ml[r, 0])
+
+            with T.SimtVF(threads=threads):
+                for r in T.Parallel(RP):
+                    row_sum[r] = 0.0
+                for i in T.serial(NS):
+                    for r in T.Parallel(RP):
+                        wts[i, r] = T.exp(lse[i, r] - row_max[r])
+                        row_sum[r] = row_sum[r] + wts[i, r]
+
+                for r, c in T.Parallel(RP, chunk_d):
+                    acc[r, c] = 0.0
+
+            if num_stages > 1:
+                for i in T.Pipelined(NS, num_stages=num_stages):
+                    T.copy(
+                        O_partial[i, b, h0:h0 + RP, dc * chunk_d:(dc + 1) * chunk_d],
+                        tmp,
+                    )
+                    with T.SimtVF(threads=threads):
+                        for r, c in T.Parallel(RP, chunk_d):
+                            acc[r, c] = acc[r, c] + tmp[r, c] * wts[i, r]
+            else:
+                for i in T.serial(NS):
+                    T.copy(
+                        O_partial[i, b, h0:h0 + RP, dc * chunk_d:(dc + 1) * chunk_d],
+                        tmp,
+                    )
+                    with T.SimtVF(threads=threads):
+                        for r, c in T.Parallel(RP, chunk_d):
+                            acc[r, c] = acc[r, c] + tmp[r, c] * wts[i, r]
+
+            with T.SimtVF(threads=threads):
+                for r, c in T.Parallel(RP, chunk_d):
+                    out_h[r, c] = acc[r, c] / row_sum[r]
+
+            T.copy(out_h, O[b, h0:h0 + RP, dc * chunk_d:(dc + 1) * chunk_d])
+
+    return merge_main
+
+
+def compile_mla_decode_splitk(
+    batch,
+    heads,
+    kv_len,
+    dim,
+    pe_dim,
+    block_H=128,
+    block_N=None,
+    chunk_d=None,
+    softmax_scale=None,
+    num_split=8,
+    threads=1024,
+    num_stages=2,
+    fuse_qk=True,
+    fuse_rescale=True,
+    merge_rows=16,
+    merge_stages=4,
+    merge_chunk_d=None,
+):
+    """Compile both phases and return one callable with the baseline signature.
+
+    ``block_N``/``chunk_d``/``merge_chunk_d`` default to ``None``, which picks the
+    measured-best tiling for the shape (see ``pick_tiling``) instead of one fixed
+    value: the larger score tile only pays off once the KV axis is long enough to
+    hold it.
+    """
+    block_N, chunk_d, merge_chunk_d = pick_tiling(
+        kv_len, dim, block_N, chunk_d, merge_chunk_d
+    )
+    partial = tilelang.compile(
+        mla_decode_splitk_fwd(
+            batch=batch,
+            heads=heads,
+            kv_len=kv_len,
+            dim=dim,
+            pe_dim=pe_dim,
+            block_H=block_H,
+            block_N=block_N,
+            chunk_d=chunk_d,
+            softmax_scale=softmax_scale,
+            num_split=num_split,
+            threads=threads,
+            num_stages=num_stages,
+            fuse_qk=fuse_qk,
+            fuse_rescale=fuse_rescale,
+        ),
+        out_idx=[4, 5],
+    )
+    merge = tilelang.compile(
+        mla_decode_merge(
+            batch=batch,
+            heads=heads,
+            kv_len=kv_len,
+            dim=dim,
+            pe_dim=pe_dim,
+            block_H=block_H,
+            block_N=block_N,
+            # The merge tiles the output columns independently of phase 1: its
+            # only link to phase 1 is the O_partial layout, which is [.., dim].
+            chunk_d=merge_chunk_d,
+            num_split=num_split,
+            rows_per_block=merge_rows,
+            num_stages=merge_stages,
+        ),
+        out_idx=[2],
+    )
+
+    def run(q, q_pe, kv, k_pe):
+        o_partial, ml = partial(q, q_pe, kv, k_pe)
+        return merge(o_partial, ml)
+
+    return run

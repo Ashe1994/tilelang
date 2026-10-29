@@ -14,21 +14,18 @@ This file widens the coverage in four directions:
 ``effective_split`` (the reduction that forces the split count to divide the KV
 block count) is additionally unit-tested without touching the device.
 
-    pytest test_mla_decode_splitk_matrix.py -q
+    python -m pytest test_mla_decode_splitk_matrix.py -q
 """
-
-import os
-import sys
 
 import pytest
 import torch
-import torch_npu  # noqa: F401
 
-ASCEND_DIR = "/data/h00662772/tilelang/examples/ascend"
-if ASCEND_DIR not in sys.path:
-    sys.path.insert(0, ASCEND_DIR)
-if os.getcwd() not in sys.path:
-    sys.path.insert(0, os.getcwd())
+import tilelang.testing
+
+try:  # a CUDA-only build has no torch_npu; requires_ascend skips those cases
+    import torch_npu  # noqa: F401
+except ImportError:  # pragma: no cover
+    torch_npu = None
 
 from example_mla_decode_splitk import compile_mla_decode_splitk, effective_split
 
@@ -85,6 +82,7 @@ def make_inputs(batch, heads, kv_len, dim, pe_dim, q_scale=1.0, seed=0):
     return q, q_pe, kv, k_pe
 
 
+@tilelang.testing.requires_ascend
 @pytest.mark.parametrize(
     "test_id,batch,heads,kv_len,dim,pe_dim,num_split,q_scale",
     CASES,
@@ -115,6 +113,7 @@ def test_matrix(test_id, batch, heads, kv_len, dim, pe_dim, num_split, q_scale):
     assert actual.shape == expected.shape
 
 
+@tilelang.testing.requires_ascend
 def test_deterministic():
     """The merge writes splits in a fixed order, so two runs must match bitwise."""
     batch, heads, kv_len, dim, pe_dim, num_split = 2, 128, 1024, 512, 64, 8
@@ -175,6 +174,7 @@ def test_rejects_unsupported(override):
         mla_decode_splitk_fwd(**kwargs)
 
 
+@tilelang.testing.requires_ascend
 def test_threads_1024():
     """threads=1024 was recommended by the sweep, so assert it is correct too."""
     batch, heads, kv_len, dim, pe_dim, num_split = 1, 128, 512, 512, 64, 8

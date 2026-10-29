@@ -2,17 +2,22 @@
 
 The execution backend is chosen by the environment, never by the test:
 
-    TILELANG_DEFAULT_TARGET=pto    pytest test_mla_decode.py -q
-    TILELANG_DEFAULT_TARGET=ascend pytest test_mla_decode.py -q
+    TILELANG_DEFAULT_TARGET=pto    python -m pytest test_mla_decode.py -q
+    TILELANG_DEFAULT_TARGET=ascend python -m pytest test_mla_decode.py -q
 """
 
 import pytest
 import torch
-import torch_npu  # noqa: F401
 
 import tilelang
-from example_mla_decode import mla_decode_fwd
+import tilelang.testing
 
+try:  # a CUDA-only build has no torch_npu; requires_ascend skips those cases
+    import torch_npu  # noqa: F401
+except ImportError:  # pragma: no cover
+    torch_npu = None
+
+from example_mla_decode import mla_decode_fwd
 
 CASES = [
     # id, batch, heads, kv_len, dim, pe_dim
@@ -43,6 +48,7 @@ def make_inputs(batch, heads, kv_len, dim, pe_dim, seed=0):
     return q, q_pe, kv, k_pe
 
 
+@tilelang.testing.requires_ascend
 @pytest.mark.parametrize("name,batch,heads,kv_len,dim,pe_dim", CASES, ids=[c[0] for c in CASES])
 def test_mla_decode(name, batch, heads, kv_len, dim, pe_dim):
     scale = (dim + pe_dim) ** -0.5

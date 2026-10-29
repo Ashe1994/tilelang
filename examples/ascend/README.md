@@ -12,9 +12,11 @@ Inputs, reference computations and correctness checks run on the NPU.
 | [Vector addition](example_vecadd.py) | SIMT and explicit SIMD with pipelined data movement |
 | [RMSNorm](example_rmsnorm.py) | SIMT fragments, reduction and pipelined row processing |
 | [FP8 quantization](example_per_token_cast_to_fp8.py) | The same group-wise quantization in SIMT and explicit SIMD |
+| [MLA decode](mla_decode/README.md) | DeepSeek MLA decode with split-KV (flash-decoding) and a paged KV cache |
 
 For advanced GEMM implementations and tuning, see [deepgemm](deepgemm).
-Attention kernels are in [flash_attention](flash_attention/README.md).
+Attention kernels are in [flash_attention](flash_attention/README.md) and
+[mla_decode](mla_decode/README.md).
 
 Run an example directly to check correctness and report device performance.
 GEMM and attention report latency and TFLOPS; vector addition, RMSNorm and FP8
@@ -40,6 +42,7 @@ python examples/ascend/example_per_token_cast_to_fp8.py
 python examples/ascend/example_per_token_cast_to_fp8.py --mode simd
 python examples/ascend/example_rmsnorm.py --no-bench
 python -m pytest examples/ascend/test_rmsnorm.py -q
+python -m pytest examples/ascend/mla_decode -q
 ```
 
 Each top-level `example_<name>.py` has one `test_<name>.py`. Correctness tests use

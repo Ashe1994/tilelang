@@ -5,7 +5,7 @@ ignores ``block_table`` (i.e. reads pages linearly) produces wrong numbers and
 fails. Sequence lengths vary per batch, and page sizes are chosen to exercise
 both geometries: several tiles inside one page, and one tile spanning pages.
 
-    TILELANG_DEFAULT_TARGET=ascend pytest test_mla_decode_paged_ascend.py -q
+    TILELANG_DEFAULT_TARGET=ascend python -m pytest test_mla_decode_paged.py -q
 """
 
 import math
@@ -14,15 +14,22 @@ import sys
 
 import pytest
 import torch
-import torch_npu  # noqa: F401
 
-ASCEND_DIR = "/data/h00662772/tilelang/examples/ascend"
-if ASCEND_DIR not in sys.path:
-    sys.path.insert(0, ASCEND_DIR)
-if os.getcwd() not in sys.path:
-    sys.path.insert(0, os.getcwd())
+import tilelang.testing
 
-from example_mla_decode_paged_ascend import compile_mla_decode_paged
+try:  # the kernel only compiles on an Ascend host; keep this importable elsewhere
+    import torch_npu  # noqa: F401
+except ImportError:  # pragma: no cover
+    torch_npu = None
+
+# The example kernels live next to this test file, so a same-directory import is
+# enough. pytest already prepends the test directory; the explicit insert keeps
+# `python -m pytest <file>` working from any cwd.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+from example_mla_decode_paged import compile_mla_decode_paged
 
 D, PE = 512, 64
 
@@ -38,6 +45,28 @@ CASES = [
     ("seq_exact_page", 1, [64], 64, 64, 1),
     ("ns1", 2, [128, 256], 64, 128, 1),
     ("multi_block", 1, [512], 64, 128, 4),
+]
+
+
+# P5 additions (task-3): the inherited 11 cases above are all thin on batch size.
+# These widen the paged path exactly where README section 5 says "not verified":
+#   * batch > 1 with shuffled physical pages and per-batch variable length
+#   * empty splits per batch (some batches own fewer KV blocks than num_split)
+#   * the page-128 / block_N-128 geometry (page == tile), missing before
+#   * num_split beyond the block count (ns=32 with 4-8 blocks) and ns=1
+#   * very short sequences (seq=1) where the mask covers a whole tile
+#
+# id, batch, seq_lens(list), block_size, block_N, num_split, seed
+MULTIBATCH_CASES = [
+    ("mb_b4_mixed", 4, [64, 129, 300, 512], 64, 128, 4, 11),
+    ("mb_b4_empty_split", 4, [1, 64, 128, 300], 64, 128, 8, 12),
+    ("mb_b8_mixed", 8, [33, 64, 129, 200, 257, 300, 384, 512], 128, 64, 4, 13),
+    ("mb_b2_page_eq_tile", 2, [128, 512], 128, 128, 4, 14),
+    ("mb_b2_page_eq_tile_ns1", 2, [65, 192], 64, 64, 1, 15),
+    ("mb_b2_ns32_empty", 2, [512, 1024], 64, 128, 32, 16),
+    ("mb_b4_one_block", 4, [64, 64, 64, 64], 64, 128, 4, 17),
+    ("mb_b4_long_mixed", 4, [1024, 769, 512, 256], 128, 128, 8, 18),
+    ("mb_b2_tiny_seq", 2, [1, 17], 64, 128, 2, 19),
 ]
 
 
@@ -83,6 +112,7 @@ def ref_paged(q, q_pe, kv, k_pe, table, seqlens, block_size, scale):
     return out
 
 
+@tilelang.testing.requires_ascend
 @pytest.mark.parametrize(
     "name,batch,seq_lens,block_size,block_N,num_split",
     CASES,
@@ -113,6 +143,78 @@ def test_paged(name, batch, seq_lens, block_size, block_N, num_split):
     torch.testing.assert_close(actual, expected.float(), rtol=1e-2, atol=1e-2)
 
 
+@tilelang.testing.requires_ascend
+@pytest.mark.parametrize(
+    "name,batch,seq_lens,block_size,block_N,num_split,seed",
+    MULTIBATCH_CASES,
+    ids=[c[0] for c in MULTIBATCH_CASES],
+)
+def test_paged_multibatch(name, batch, seq_lens, block_size, block_N, num_split, seed):
+    """batch > 1: per-batch variable length over shuffled physical pages."""
+    scale = (D + PE) ** -0.5
+    q, q_pe, kv, k_pe, table, seqlens, max_pages = make_paged(
+        batch, seq_lens, block_size, seed=seed
+    )
+
+    run = compile_mla_decode_paged(
+        batch=batch,
+        heads=128,
+        num_slots=kv.shape[0],
+        dim=D,
+        pe_dim=PE,
+        block_size=block_size,
+        max_pages=max_pages,
+        block_N=block_N,
+        num_split=num_split,
+        softmax_scale=scale,
+    )
+    out = run(q, q_pe, kv, k_pe, table, seqlens)
+    torch.npu.synchronize()
+
+    expected = ref_paged(q, q_pe, kv, k_pe, table, seqlens, block_size, scale)
+    actual = out.float()
+    assert torch.isfinite(actual).all(), f"{name}: NaN/Inf"
+    torch.testing.assert_close(actual, expected.float(), rtol=1e-2, atol=1e-2)
+
+
+@tilelang.testing.requires_ascend
+def test_block_table_is_honoured_multibatch():
+    """batch>1: repointing a page of ONE batch changes that batch only.
+
+    A cross-batch gather bug (e.g. reading ``block_table[0]`` for every batch)
+    would leave the other batches untouched but make batch 2 independent of its
+    own table, so both halves of this assertion are needed.
+    """
+    scale = (D + PE) ** -0.5
+    batch, seq, block_size, block_N, num_split = 4, 256, 64, 128, 4
+    q, q_pe, kv, k_pe, table, seqlens, max_pages = make_paged(
+        batch, [seq] * batch, block_size, seed=21
+    )
+    run = compile_mla_decode_paged(
+        batch=batch, heads=128, num_slots=kv.shape[0], dim=D, pe_dim=PE,
+        block_size=block_size, max_pages=max_pages, block_N=block_N,
+        num_split=num_split, softmax_scale=scale,
+    )
+    out_a = run(q, q_pe, kv, k_pe, table, seqlens).clone()
+    torch.npu.synchronize()
+
+    # first physical page that no live table entry points at
+    spare_page = batch * max_pages
+    table2 = table.clone()
+    table2[2, 0] = spare_page
+    out_b = run(q, q_pe, kv, k_pe, table2, seqlens)
+    torch.npu.synchronize()
+
+    changed = not torch.allclose(out_a[2].float(), out_b[2].float(), rtol=1e-2, atol=1e-2)
+    assert changed, "repointing batch 2's page did not change batch 2: block_table ignored"
+
+    for b in (0, 1, 3):
+        assert torch.allclose(out_a[b].float(), out_b[b].float(), rtol=1e-2, atol=1e-2), (
+            f"repointing batch 2's page changed batch {b}: per-batch table indexing is wrong"
+        )
+
+
+@tilelang.testing.requires_ascend
 def test_block_table_is_honoured():
     """A wrong gather must not accidentally pass: permuting the table changes O."""
     scale = (D + PE) ** -0.5

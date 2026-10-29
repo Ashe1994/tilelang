@@ -2,27 +2,23 @@
 
 Same cases as ``test_mla_decode.py`` plus the long-KV shape the split exists for:
 
-    TILELANG_DEFAULT_TARGET=pto    pytest test_mla_decode_splitk.py -q
-    TILELANG_DEFAULT_TARGET=ascend pytest test_mla_decode_splitk.py -q
+    TILELANG_DEFAULT_TARGET=pto    python -m pytest test_mla_decode_splitk.py -q
+    TILELANG_DEFAULT_TARGET=ascend python -m pytest test_mla_decode_splitk.py -q
 
 Every case is additionally checked against the ``num_split == 1`` kernel, so the
 merge path is validated against an independent implementation of the same math.
 """
 
-import os
-import sys
-
 import pytest
 import torch
-import torch_npu  # noqa: F401
 
 import tilelang
+import tilelang.testing
 
-ASCEND_DIR = "/data/h00662772/tilelang/examples/ascend"
-if ASCEND_DIR not in sys.path:
-    sys.path.insert(0, ASCEND_DIR)
-if os.getcwd() not in sys.path:
-    sys.path.insert(0, os.getcwd())
+try:  # a CUDA-only build has no torch_npu; requires_ascend skips those cases
+    import torch_npu  # noqa: F401
+except ImportError:  # pragma: no cover
+    torch_npu = None
 
 from example_mla_decode import mla_decode_fwd as mla_decode_fwd_baseline
 from example_mla_decode_splitk import compile_mla_decode_splitk
@@ -57,7 +53,10 @@ def make_inputs(batch, heads, kv_len, dim, pe_dim, seed=0):
     return q, q_pe, kv, k_pe
 
 
-@pytest.mark.parametrize("name,batch,heads,kv_len,dim,pe_dim,num_split", CASES, ids=[c[0] for c in CASES])
+@tilelang.testing.requires_ascend
+@pytest.mark.parametrize(
+    "name,batch,heads,kv_len,dim,pe_dim,num_split", CASES, ids=[c[0] for c in CASES]
+)
 def test_mla_decode_splitk(name, batch, heads, kv_len, dim, pe_dim, num_split):
     scale = (dim + pe_dim) ** -0.5
     run = compile_mla_decode_splitk(

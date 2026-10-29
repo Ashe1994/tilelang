@@ -2,7 +2,7 @@
 
 Multi-head Latent Attention decode:
 
-    O[b,h,:] = sum_s softmax( (Q[b,h,:]·KV[b,s,:] + Q_pe[b,h,:]·K_pe[b,s,:]) * scale ) * KV[b,s,:]
+    O[b,h,:] = sum_s softmax( (Q[b,h,:] @ KV[b,s,:] + Q_pe[b,h,:] @ K_pe[b,s,:]) * scale ) * KV[b,s,:]
     scale    = (dim + pe_dim) ** -0.5
 
 V reuses KV. Query length is 1 per (batch, head), so the M axis of the first
@@ -175,7 +175,7 @@ def mla_decode_fwd(
 
                 T.dual_copy(p_ub[0:ROWS, 0:block_N], p_l1[0:block_H, 0:block_N])
 
-                # P·V over output-column chunks, unrolled at Python level.
+                # P.V over output-column chunks, unrolled at Python level.
                 for i, vb in enumerate(v_l1):
                     T.gemm(p_l1[0:block_H, 0:block_N], vb, o_l0c, transpose_B=True, clear_accum=True)
                     T.dual_copy(o_l0c, o_tmp_ub[0:ROWS, 0:chunk_d])

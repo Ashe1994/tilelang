@@ -22,13 +22,20 @@ reach it, which serialises the merge behind the slowest split and still needs th
 partials to round-trip through GM. Two launches overlap nothing but cost one
 extra kernel boundary.
 
-Phase 1 writes ``O_partial`` as float32 -- the partials are unnormalised, so an
-fp16 round trip would lose accuracy -- and ``ML``, a
-``[num_split, batch, heads, ML_WIDTH]`` float32 tensor whose column 0 holds
-``lse``. The wide row exists because the partial write reuses ``T.dual_copy``,
-whose UB->GM path merges the two AIV halves of the M axis through one DMA; a
-1-wide region is not a useful transfer shape, and 32 fp32 lanes (128 B) keep the
-destination row aligned.
+Phase 1 writes ``ML``, a ``[num_split, batch, heads, ML_WIDTH]`` float32 tensor
+whose column 0 holds ``lse``. The wide row exists because the partial write
+reuses ``T.dual_copy``, whose UB->GM path merges the two AIV halves of the M axis
+through one DMA; a 1-wide region is not a useful transfer shape, and 32 fp32
+lanes (128 B) keep the destination row aligned.
+
+``partial_dtype`` selects the dtype of ``O_partial``. The default (``float32``)
+is the reference path. ``float16`` halves the phase-2 ``mte2`` traffic, but on
+Ascend 950PR that measured no gain (the merge is latency bound, not byte bound:
+``AIV vec`` is 91% of its duration against 69.9% for ``mte2``), so it stays an
+opt-in knob for shapes where the merge really is DMA bound. The partials written
+here are already **normalised** inside the split (``O_p[s]/l_s``), so the merge
+is a convex combination of O(1) values and an fp16 round trip costs about one
+fp16 epsilon of relative error on the final output, which is itself fp16.
 
 Every platform constraint of the ``num_split == 1`` kernel still applies
 (``block_H == 128``, NT-only L1 GEMM, V transposed into one independent L1 buffer
@@ -87,8 +94,36 @@ def mla_decode_splitk_fwd(
     num_stages=2,
     fuse_qk=True,
     fuse_rescale=True,
+    vector_mode="simd_rc",
+    partial_dtype="float32",
 ):
     """Phase 1: per-split partial attention output + log-sum-exp.
+
+    ``vector_mode`` selects how the per-KV-block elementwise vector work runs.
+    The rescale/accumulate is ``o = o*alpha + pv`` over ``dim`` columns per KV
+    block -- the largest elementwise pass -- and on the vector unit it is one
+    vmul + one vadd per 64 fp32 lanes instead of one scalar op per thread:
+
+      "simt"     -- everything in ``T.SimtVF`` (the original kernel)
+      "simd_rc"  -- PV rescale/accumulate in ``T.SimdVF``  [default, see below]
+      "simd_exp" -- exp + fp16 cast in ``T.SimdVF``
+      "simd"     -- both of the above
+
+    Default is ``"simd_rc"``: it is the pass that both wins and fits the UB
+    budget. ``"simd_exp"``/``"simd"`` overflow UB at the benchmark shape
+    (``kv_len=8192``, ``block_N=128``, ``num_split=16`` ->
+    ``dyn_ubuf_bytes=222208`` > the 950PR limit, see the README's UB budget notes) because the
+    pipelined KV loop then double-buffers its score tile; they do run for
+    BPS<=1 shapes. Measured on the benchmark shape: e2e 78.94 -> 71.06 us
+    (-10.0%), rel error unchanged at 3.4e-04.
+
+    The SimdVF exp needs explicit MicroAPI intrinsics: ``AscendSimdVFLowerParallel``
+    accepts only load/add/sub/mul/div/exp/log/sqrt/fabs inside a SimdVF block, so
+    ``T.exp`` and ``T.if_then_else`` are rejected there, while
+    ``T.simd.vexpdif`` is a single fused ``exp(a-b)`` instruction. Every SimdVF
+    pass also falls back to SimtVF automatically when the tiled width is not a
+    whole number of vector registers (``block_N % 64`` / ``chunk_d % 64``), which
+    keeps the ``block_N=32`` tilings working.
 
     ``fuse_qk`` accumulates the pe-half and content-half QK GEMMs in one L0C
     buffer (``clear_accum=False`` on the second) instead of producing two score
@@ -101,6 +136,9 @@ def mla_decode_splitk_fwd(
     scale = float(softmax_scale) if softmax_scale is not None else (dim + pe_dim) ** -0.5
     dtype = "float16"
     accum_dtype = "float32"
+    assert partial_dtype in (accum_dtype, dtype), (
+        'partial_dtype must be "float32" or "float16"'
+    )
 
     ROWS = block_H // 2
     NUM_M_TILES = heads // block_H
@@ -109,6 +147,13 @@ def mla_decode_splitk_fwd(
     NS = effective_split(kv_len, block_N, num_split)
     BPS = KV_BLOCKS // NS
     NUM_BLOCKS = batch * NUM_M_TILES * NS
+
+    # A SimdVF pass holds 64 fp32 lanes per vector register, so the tiled axis
+    # must be a whole number of registers; otherwise fall back to SimtVF.
+    assert vector_mode in ("simt", "simd", "simd_exp", "simd_rc"), \
+        "vector_mode must be simt|simd|simd_exp|simd_rc"
+    simd_exp = vector_mode in ("simd", "simd_exp") and block_N % 64 == 0
+    simd_rc = vector_mode in ("simd", "simd_rc") and chunk_d % 64 == 0
 
     assert block_H == 128, "block_H must be 128 (T.dual_copy L0C->UB requires M=128)"
     assert heads % block_H == 0, "heads must be a multiple of block_H"
@@ -122,7 +167,7 @@ def mla_decode_splitk_fwd(
         Q_pe: T.Tensor((batch, heads, pe_dim), dtype),
         KV: T.Tensor((batch, kv_len, dim), dtype),
         K_pe: T.Tensor((batch, kv_len, pe_dim), dtype),
-        O_partial: T.Tensor((NS, batch, heads, dim), accum_dtype),
+        O_partial: T.Tensor((NS, batch, heads, dim), partial_dtype),
         ML: T.Tensor((NS, batch, heads, ML_WIDTH), accum_dtype),
     ):
         with T.Kernel(NUM_BLOCKS) as bx:
@@ -155,6 +200,10 @@ def mla_decode_splitk_fwd(
             o_ub = [T.alloc_shared((ROWS, chunk_d), accum_dtype) for _ in range(NUM_DC)]
             o_tmp_ub = T.alloc_shared((ROWS, chunk_d), accum_dtype)
             ml_ub = T.alloc_shared((ROWS, ML_WIDTH), accum_dtype)
+            if partial_dtype != accum_dtype:
+                # fp16 publish staging, one output-column chunk at a time:
+                # ROWS * chunk_d * 2 B = 8 KiB at ROWS=64, chunk_d=64.
+                o_out_ub = T.alloc_shared((ROWS, chunk_d), partial_dtype)
 
             m_ub = T.alloc_shared((ROWS,), accum_dtype)
             l_ub = T.alloc_shared((ROWS,), accum_dtype)
@@ -232,13 +281,38 @@ def mla_decode_splitk_fwd(
                         alpha_ub[r] = T.exp(m_ub[r] - new_m)
                         m_ub[r] = new_m
 
-                    # exp and the fp16 cast in one pass (the separate p_ub = s_ub
-                    # copy was a full extra sweep of the score tile)
-                    for r, c in T.Parallel(ROWS, block_N):
-                        e = T.exp(s_ub[r, c] - m_ub[r])
-                        s_ub[r, c] = e
-                        p_ub[r, c] = e
+                    if not simd_exp:
+                        # exp and the fp16 cast in one pass (the separate p_ub =
+                        # s_ub copy was a full extra sweep of the score tile)
+                        for r, c in T.Parallel(ROWS, block_N):
+                            e = T.exp(s_ub[r, c] - m_ub[r])
+                            s_ub[r, c] = e
+                            p_ub[r, c] = e
 
+                if simd_exp:
+                    # exp(s - m) and the fp16 cast, straight on the vector unit.
+                    # vexpdif is the fused exp(a-b) instruction; the fp16 result
+                    # is packed-pair stored, so no separate conversion sweep.
+                    with T.SimdVF():
+                        mask32 = T.simd.pset(32)
+                        mask16 = T.simd.pset(16)
+                        for r in T.serial(ROWS):
+                            mb = T.simd.vld(m_ub[r], dist="BRC_B32")
+                            for ck in T.serial(block_N // 64):
+                                e = T.simd.vexpdif(
+                                    T.simd.vld(s_ub[r, ck * 64]),
+                                    mb,
+                                    mask32,
+                                )
+                                T.simd.vsts(s_ub[r, ck * 64], e, mask32)
+                                T.simd.vsts(
+                                    p_ub[r, ck * 64],
+                                    T.simd.vcvt(e, dtype),
+                                    mask16,
+                                    dist="PK_B32",
+                                )
+
+                with T.SimtVF(threads=threads):
                     red_sum = T.alloc_reducer((ROWS,), accum_dtype, op="sum")
                     T.reducer_init(red_sum)
                     for r, c in T.Parallel(ROWS, block_N):
@@ -256,35 +330,58 @@ def mla_decode_splitk_fwd(
 
                 T.dual_copy(p_ub[0:ROWS, 0:block_N], p_l1[0:block_H, 0:block_N])
 
-                # P·V over output-column chunks, unrolled at Python level.
+                # P.V over output-column chunks, unrolled at Python level.
                 for i, vb in enumerate(v_l1):
                     T.gemm(p_l1[0:block_H, 0:block_N], vb, o_l0c, transpose_B=True, clear_accum=True)
                     T.dual_copy(o_l0c, o_tmp_ub[0:ROWS, 0:chunk_d])
-                    with T.SimtVF(threads=threads):
-                        if fuse_rescale:
-                            # One pass instead of "rescale all chunks, then add".
-                            for r, c in T.Parallel(ROWS, chunk_d):
-                                o_ub[i][r, c] = o_ub[i][r, c] * alpha_ub[r] + o_tmp_ub[r, c]
-                        else:
-                            for r, c in T.Parallel(ROWS, chunk_d):
-                                o_ub[i][r, c] = o_ub[i][r, c] + o_tmp_ub[r, c]
+                    if simd_rc:
+                        with T.SimdVF():
+                            if fuse_rescale:
+                                for r, c in T.Parallel(ROWS, chunk_d):
+                                    o_ub[i][r, c] = o_ub[i][r, c] * alpha_ub[r] + o_tmp_ub[r, c]
+                            else:
+                                for r, c in T.Parallel(ROWS, chunk_d):
+                                    o_ub[i][r, c] = o_ub[i][r, c] + o_tmp_ub[r, c]
+                    else:
+                        with T.SimtVF(threads=threads):
+                            if fuse_rescale:
+                                # One pass instead of "rescale all chunks, then add".
+                                for r, c in T.Parallel(ROWS, chunk_d):
+                                    o_ub[i][r, c] = o_ub[i][r, c] * alpha_ub[r] + o_tmp_ub[r, c]
+                            else:
+                                for r, c in T.Parallel(ROWS, chunk_d):
+                                    o_ub[i][r, c] = o_ub[i][r, c] + o_tmp_ub[r, c]
 
             # ---- publish partials: per-split output + row log-sum-exp ----
             # Normalise inside the split so the merge is the standard
             # flash-decoding weighted average over log-sum-exp values; an
             # unnormalised partial would need m_s as a second scalar.
-            with T.SimtVF(threads=threads):
-                for ob in o_ub:
-                    for r, c in T.Parallel(ROWS, chunk_d):
-                        ob[r, c] = ob[r, c] / l_ub[r]
+            if partial_dtype == accum_dtype:
+                with T.SimtVF(threads=threads):
+                    for ob in o_ub:
+                        for r, c in T.Parallel(ROWS, chunk_d):
+                            ob[r, c] = ob[r, c] / l_ub[r]
 
-            # enumerate() keeps this a Python-level unroll; a `for i in range(N)`
-            # would become a TIR loop whose index cannot subscript a Python list.
-            for i, ob in enumerate(o_ub):
-                T.dual_copy(
-                    ob[0:ROWS, 0:chunk_d],
-                    O_partial[sid, b, h0:h0 + block_H, i * chunk_d:(i + 1) * chunk_d],
-                )
+                # enumerate() keeps this a Python-level unroll; a `for i in range(N)`
+                # would become a TIR loop whose index cannot subscript a Python list.
+                for i, ob in enumerate(o_ub):
+                    T.dual_copy(
+                        ob[0:ROWS, 0:chunk_d],
+                        O_partial[sid, b, h0:h0 + block_H, i * chunk_d:(i + 1) * chunk_d],
+                    )
+            else:
+                # fp16 partial: normalise straight into the fp16 staging buffer and
+                # stream that out, so O_partial is written at half the DMA bytes.
+                # One staging buffer is reused per chunk (WAR handled by the same
+                # sync pattern as the PV loop above).
+                for i, ob in enumerate(o_ub):
+                    with T.SimtVF(threads=threads):
+                        for r, c in T.Parallel(ROWS, chunk_d):
+                            o_out_ub[r, c] = ob[r, c] / l_ub[r]
+                    T.dual_copy(
+                        o_out_ub[0:ROWS, 0:chunk_d],
+                        O_partial[sid, b, h0:h0 + block_H, i * chunk_d:(i + 1) * chunk_d],
+                    )
 
             with T.SimtVF(threads=threads):
                 for r, c in T.Parallel(ROWS, ML_WIDTH):
@@ -311,6 +408,7 @@ def mla_decode_merge(
     num_stages=4,
     ns_explicit=None,
     ml_width=ML_WIDTH,
+    partial_dtype="float32",
 ):
     """Phase 2: combine the per-split partials into the final fp16 output.
 
@@ -324,6 +422,9 @@ def mla_decode_merge(
     """
     dtype = "float16"
     accum_dtype = "float32"
+    assert partial_dtype in (accum_dtype, dtype), (
+        'partial_dtype must be "float32" or "float16"'
+    )
 
     RP = block_H if rows_per_block is None else rows_per_block
     assert block_H % RP == 0, "block_H must be a multiple of rows_per_block"
@@ -337,7 +438,7 @@ def mla_decode_merge(
 
     @T.prim_func
     def merge_main(
-        O_partial: T.Tensor((NS, batch, heads, dim), accum_dtype),
+        O_partial: T.Tensor((NS, batch, heads, dim), partial_dtype),
         ML: T.Tensor((NS, batch, heads, ml_width), accum_dtype),
         O: T.Tensor((batch, heads, dim), dtype),
     ):
@@ -348,7 +449,10 @@ def mla_decode_merge(
             dc = (rem // RSPLIT) % NUM_DC
 
             acc = T.alloc_shared((RP, chunk_d), accum_dtype)
-            tmp = T.alloc_shared((RP, chunk_d), accum_dtype)
+            # The streamed partial tile keeps the element type it has in GM, so an
+            # fp16 O_partial moves half the bytes; the widening happens in the
+            # accumulate below, not in an extra staging buffer.
+            tmp = T.alloc_shared((RP, chunk_d), partial_dtype)
             out_h = T.alloc_shared((RP, chunk_d), dtype)
             ml = T.alloc_shared((RP, ml_width), accum_dtype)
             # The split axis is a TIR loop, not a Python unroll: unrolling one
@@ -398,7 +502,10 @@ def mla_decode_merge(
                     )
                     with T.SimtVF(threads=threads):
                         for r, c in T.Parallel(RP, chunk_d):
-                            acc[r, c] = acc[r, c] + tmp[r, c] * wts[i, r]
+                            if partial_dtype == accum_dtype:
+                                acc[r, c] = acc[r, c] + tmp[r, c] * wts[i, r]
+                            else:
+                                acc[r, c] = acc[r, c] + T.cast(tmp[r, c], accum_dtype) * wts[i, r]
             else:
                 for i in T.serial(NS):
                     T.copy(
@@ -407,7 +514,10 @@ def mla_decode_merge(
                     )
                     with T.SimtVF(threads=threads):
                         for r, c in T.Parallel(RP, chunk_d):
-                            acc[r, c] = acc[r, c] + tmp[r, c] * wts[i, r]
+                            if partial_dtype == accum_dtype:
+                                acc[r, c] = acc[r, c] + tmp[r, c] * wts[i, r]
+                            else:
+                                acc[r, c] = acc[r, c] + T.cast(tmp[r, c], accum_dtype) * wts[i, r]
 
             with T.SimtVF(threads=threads):
                 for r, c in T.Parallel(RP, chunk_d):
@@ -436,6 +546,8 @@ def compile_mla_decode_splitk(
     merge_rows=16,
     merge_stages=4,
     merge_chunk_d=None,
+    vector_mode="simd_rc",
+    partial_dtype="float32",
 ):
     """Compile both phases and return one callable with the baseline signature.
 
@@ -443,6 +555,11 @@ def compile_mla_decode_splitk(
     measured-best tiling for the shape (see ``pick_tiling``) instead of one fixed
     value: the larger score tile only pays off once the KV axis is long enough to
     hold it.
+
+    ``vector_mode`` selects the phase-1 vector programming model and
+    ``partial_dtype`` the dtype of the phase-1 -> phase-2 staging tensor; both are
+    pass-through knobs documented on ``mla_decode_splitk_fwd`` and
+    ``mla_decode_merge``.
     """
     block_N, chunk_d, merge_chunk_d = pick_tiling(
         kv_len, dim, block_N, chunk_d, merge_chunk_d
@@ -463,6 +580,8 @@ def compile_mla_decode_splitk(
             num_stages=num_stages,
             fuse_qk=fuse_qk,
             fuse_rescale=fuse_rescale,
+            vector_mode=vector_mode,
+            partial_dtype=partial_dtype,
         ),
         out_idx=[4, 5],
     )
@@ -481,6 +600,7 @@ def compile_mla_decode_splitk(
             num_split=num_split,
             rows_per_block=merge_rows,
             num_stages=merge_stages,
+            partial_dtype=partial_dtype,
         ),
         out_idx=[2],
     )

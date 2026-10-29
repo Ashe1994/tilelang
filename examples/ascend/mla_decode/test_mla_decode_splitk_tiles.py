@@ -1,28 +1,25 @@
-"""P0: correctness sweep over tile parameters.
+"""Correctness sweep over the tile parameters of the split-KV MLA decode kernel.
 
 The kernel had correctness evidence only at the default
-`block_N=64 / chunk_d=128 / num_stages=2`. The next optimisation steps
-(`block_N=128`, fused rescale) sit right next to this untested region, so the
+``block_N=64 / chunk_d=128 / num_stages=2``. The optimisation steps
+(``block_N=128``, fused rescale) sit right next to this untested region, so the
 grid is swept first.
 
-Shape is fixed (small enough to compile quickly) and `num_split=4` divides both
+Shape is fixed (small enough to compile quickly) and ``num_split=4`` divides both
 the 8 KV blocks (block_N=64) and the 16 KV blocks (block_N=32).
 
-    pytest test_mla_decode_splitk_tiles.py -q
+    python -m pytest test_mla_decode_splitk_tiles.py -q
 """
-
-import os
-import sys
 
 import pytest
 import torch
-import torch_npu  # noqa: F401
 
-ASCEND_DIR = "/data/h00662772/tilelang/examples/ascend"
-if ASCEND_DIR not in sys.path:
-    sys.path.insert(0, ASCEND_DIR)
-if os.getcwd() not in sys.path:
-    sys.path.insert(0, os.getcwd())
+import tilelang.testing
+
+try:  # a CUDA-only build has no torch_npu; requires_ascend skips those cases
+    import torch_npu  # noqa: F401
+except ImportError:  # pragma: no cover
+    torch_npu = None
 
 from example_mla_decode_splitk import compile_mla_decode_splitk
 
@@ -63,7 +60,10 @@ def make_inputs(seed=0):
     return q, q_pe, kv, k_pe
 
 
-@pytest.mark.parametrize("block_N,chunk_d,num_stages", TILES, ids=[f"bn{a}_cd{b}_st{c}" for a, b, c in TILES])
+@tilelang.testing.requires_ascend
+@pytest.mark.parametrize(
+    "block_N,chunk_d,num_stages", TILES, ids=[f"bn{a}_cd{b}_st{c}" for a, b, c in TILES]
+)
 def test_tile(block_N, chunk_d, num_stages):
     scale = (D + PE) ** -0.5
     run = compile_mla_decode_splitk(

@@ -437,6 +437,64 @@ stages per tile, or overlapping the softmax of one block with the PV of the
 previous one - and cross-block software pipelining is blocked by the scheduler
 (next section).
 
+## Data-volume sweep (bandwidth utilisation)
+
+`bench/bench_sweep.py` builds the complete tier table over KV-cache sizes and
+reports, per tier, correctness, end-to-end latency, achieved KV read bandwidth
+and its utilisation against the 4 TB/s GM peak of Ascend 950PR. The "moved"
+bytes are `batch * kv_len * (2*dim + pe_dim) * 2` - K, V (transposed) and k_pe
+are each streamed once, about 2x the KV-cache footprint. All tiers measured on
+the reference shape (batch=1, heads=128, dim=512, pe_dim=64) with
+`do_bench(backend="event")`, 3 rounds; host load 85-142, spread <= 0.18 us.
+
+| kv_len | KV cache | moved | dense e2e | dense TFLOPS | dense GB/s | dense util | paged e2e | paged TFLOPS | paged GB/s | paged util |
+---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 512 | 0.56 MiB | 1.06 MiB | 15.8 us | 9.1 | 70.7 | 1.77% | 22.6 us | 6.3 | 49.3 | 1.23% |
+| 1024 | 1.12 MiB | 2.12 MiB | 20.0 us | 14.2 | 111.2 | 2.78% | 23.8 us | 12.0 | 93.8 | 2.34% |
+| 2048 | 2.25 MiB | 4.25 MiB | 23.8 us | 23.9 | 187.1 | 4.68% | 28.7 us | 19.9 | 155.3 | 3.88% |
+| 4096 | 4.50 MiB | 8.50 MiB | 31.3 us | 36.5 | 284.8 | 7.12% | 38.1 us | 30.0 | 234.2 | 5.85% |
+| 8192 | 9.00 MiB | 17.0 MiB | 46.6 us | 48.9 | 382.3 | 9.56% | 57.3 us | 39.8 | 311.2 | 7.78% |
+| 16384 | 18.0 MiB | 34.0 MiB | 76.1 us | 59.9 | 468.2 | 11.71% | 95.5 us | 47.8 | 373.4 | 9.33% |
+| 32768 | 36.0 MiB | 68.0 MiB | 135.3 us | 67.4 | 526.9 | 13.17% | 171.9 us | 53.1 | 414.7 | 10.37% |
+| 65536 | 72.0 MiB | 136 MiB | 253.8 us | 71.9 | 561.9 | 14.05% | 324.7 us | 56.2 | 439.2 | 10.98% |
+
+The batch axis at `kv_len=8192` (same bytes, different shape) reproduces the
+same relation - utilisation follows the data volume, not the shape:
+
+| batch | moved | dense e2e | dense util | paged e2e | paged util |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 17 MiB | 46.4 us | 9.60% | 57.0 us | 7.82% |
+| 2 | 34 MiB | 89.2 us | 10.00% | 112.1 us | 7.95% |
+| 4 | 68 MiB | 134.6 us | 13.25% | 170.5 us | 10.46% |
+
+msprof phase-1-only captures at three tiers show the same trend on hardware
+counters (total GM read / task duration; includes the Q/Q_pe re-read per split):
+
+| tier | task | cube busy | mte2 busy | vec busy | MTE2 inst | total read | measured | util | L2 hit | mte2 wait |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| dense 1K | 12.0 us | 11.0% | 21.1% | 54.2% | 18 | 4.48 MiB | 383 GB/s | 9.6% | 74.4% | 0% |
+| dense 8K | 38.1 us | 27.7% | 41.0% | 54.4% | 102 | 19.7 MiB | 529 GB/s | 13.2% | 53.3% | 32.2% |
+| dense 32K | 126.2 us | 33.4% | 40.2% | 54.8% | 390 | 71.9 MiB | 584 GB/s | 14.6% | 48.8% | 30.8% |
+| paged 1K | 14.2 us | 9.3% | 15.7% | 62.4% | 26 | 4.48 MiB | 325 GB/s | 8.1% | 74.5% | 53.4% |
+| paged 8K | 47.8 us | 22.1% | 28.5% | 57.8% | 166 | 19.7 MiB | 423 GB/s | 10.6% | 53.3% | 61.4% |
+| paged 32K | 162.8 us | 25.9% | 32.4% | 57.2% | 646 | 71.9 MiB | 453 GB/s | 11.3% | 48.8% | 62.8% |
+
+Reading the sweep:
+
+* From 512 to 65536 tokens the dense end-to-end time scales 16.1x for 16x the
+  data, so the kernel is already linear in the data volume; utilisation climbs
+  from 1.8% to 14.1% because the fixed per-launch cost (~12-15 us) dominates the
+  small tiers. There is no tier where the kernel is bandwidth limited.
+* paged trails dense by 18-25% at every tier (453 vs 584 GB/s at 32K), matching
+  its 1.66x MTE2 instruction count (646 vs 390) and 62.8% vs 30.8% `aic_mte2_wait`.
+* the L2 read hit rate falls 74% -> 53% -> 49% as the working set leaves cache;
+  the extra misses cost far less than the dependency chain (cube/vec waits stay
+  at 96-99% at every tier).
+* the per-tier numbers are the honest utilisation ceiling for this release:
+  ~14.6% of GM peak on dense phase 1, ~11.3% on paged. Closing that gap needs
+  the structural overlap work described in the next section, not more traffic
+  reduction.
+
 ## Pipeline / multi-buffer experiments (negative results)
 
 Manual software pipelining across KV blocks is the obvious next step once the

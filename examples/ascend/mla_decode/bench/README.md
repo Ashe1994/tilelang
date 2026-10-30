@@ -12,6 +12,8 @@ needed beyond the Ascend runtime (see the [parent README](../README.md)).
 | [prof_phase1.py](prof_phase1.py) | msprof entry that builds **only** the dense phase-1 kernel (or the full call with `--which e2e`) | prints the partial-output magnitude |
 | [prof_paged.py](prof_paged.py) | msprof entry that builds only the paged phase-1 kernel (`--block-size`, `--block-n`, `--num-split`) | prints the partial-output magnitude |
 | [prof_merge.py](prof_merge.py) | msprof entry that builds only the merge kernel (`--num-split`, `--ml-width`, `--partial-dtype` default `float16`) | prints the output magnitude |
+| [bench_sweep.py](bench_sweep.py) | Complete data-volume tier table: KV sizes (and an optional batch axis) for dense and paged, each verified against the reference, with e2e latency, TFLOPS, achieved KV read bandwidth and its utilisation against the 4 TB/s GM peak | `SWEEP ... kv_len=... moved_mb=... e2e_us=... tflops=... gbps=... util_pct=...` lines, then `SWEEP_BEST` per layout |
+| [prof_sweep.py](prof_sweep.py) | msprof entry for one tier of the sweep (`--layout dense|paged --kv-len N --batch B`), building only the phase-1 kernel so the capture has a single kernel | prints the partial-output magnitude |
 | [parse_pipes.py](parse_pipes.py) | Summarises a capture's CSVs: per-pipe busy time and share, wait ratios, the L2 read hit rate, GM->L1 / GM->UB traffic and bandwidth usage, L0 bandwidth, the MTE instruction counts, group-busy totals, and the achieved TFLOPS / GB/s | one block per capture |
 
 `bench_default.py` reports the baseline above the optimized path on purpose: the
@@ -29,6 +31,14 @@ paged is faster).
 it is the slowest entry. The shipped choice per layout is recorded in the parent
 README, and the script prints a `VERDICT` line combining its acceptance checks with
 the load/spread trust flag, so it can re-validate that choice on a new shape.
+
+`bench_sweep.py` is the data-volume sweep: it prints one line per tier plus a
+`SWEEP_BEST` line per layout, and it is the tool behind the tier table in the
+parent README. `prof_sweep.py` is its profiling half - run it under `msprof op`
+for a chosen tier and feed the output directory to `parse_pipes.py`. Tiers are
+built with `--kv-lens`, the optional batch axis with `--batches`; a tier is
+roughly `2x` cheaper than the previous one in compile time, so a full 8-tier run
+takes a few minutes on a warm cache.
 
 ## Timing methodology
 

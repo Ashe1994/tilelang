@@ -7,7 +7,7 @@ needed beyond the Ascend runtime (see the [parent README](../README.md)).
 | Script | What it does | Output |
 | --- | --- | --- |
 | [bench_default.py](bench_default.py) | Baseline `num_split=1` kernel vs the shipped dense defaults; checks correctness of the optimized path first | `DEFAULTRUN rel=... baseline_us=... e2e_us=... speedup=... tflops=...` |
-| [bench_paged.py](bench_paged.py) | Paged kernel at several page sizes and split counts, with the dense optimized kernel as the in-process reference | `PGDENSE dense_optimized_us=...` then one `PG <case> ... e2e_us=... rel=... paged_over_dense=...` line per case |
+| [bench_paged.py](bench_paged.py) | Paged kernel over page size, tile width and split count, including the previous `block_N=128` default as an A/B; the dense default kernel is measured first in the same process as the reference | `PGDENSE dense_optimized_us=...` then one `PG <case> ... e2e_us=... rel=... paged_over_dense=...` line per case |
 | [bench_partial_dtype.py](bench_partial_dtype.py) | A/B of the merge input dtype: compiles phase 1 + merge for fp32 and fp16 `O_partial` in one process, checks both against the reference (plus two softmax-distribution stresses) and times merge-only, phase 1 and end-to-end interleaved. **Measured conclusion: no gain** - the merge is latency bound, so fp32 stays the default | `REL ...`, then `TIME` / `AB` / `DECOMP` / `E2E_TFLOPS` / `VERDICT` lines |
 | [prof_phase1.py](prof_phase1.py) | msprof entry that builds **only** the dense phase-1 kernel (or the full call with `--which e2e`) | prints the partial-output magnitude |
 | [prof_paged.py](prof_paged.py) | msprof entry that builds only the paged phase-1 kernel (`--block-size`, `--block-n`, `--num-split`) | prints the partial-output magnitude |

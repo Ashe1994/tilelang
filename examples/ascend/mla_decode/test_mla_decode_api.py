@@ -30,10 +30,12 @@ def test_resolve_dense_defaults():
     """Long KV picks the 128-wide tile and 16 splits; short KV falls back."""
     cfg = resolve_config(1, 128, dim=D, pe_dim=PE, kv_len=8192)
     assert cfg["paged"] is False
-    assert cfg["block_N"] == 128
-    assert cfg["chunk_d"] == 64
+    assert cfg["block_N"] == 64
+    assert cfg["chunk_d"] == 128
     assert cfg["num_split"] == 16
     assert cfg["merge_chunk_d"] == 128
+    assert cfg["vector_mode"] == "simd"
+    assert cfg["ml_width"] == 8
 
     cfg = resolve_config(1, 128, dim=D, pe_dim=PE, kv_len=64)
     assert cfg["block_N"] == 64
@@ -41,20 +43,22 @@ def test_resolve_dense_defaults():
     assert cfg["num_split"] == 1
 
     cfg = resolve_config(1, 128, dim=D, pe_dim=PE, kv_len=128)
-    assert cfg["block_N"] == 128
-    assert cfg["num_split"] == 1
+    assert cfg["block_N"] == 64
+    assert cfg["num_split"] == 2
 
 
 def test_resolve_paged_defaults():
     """Paged geometry alone selects the paged kernel; splits shrink with the cache."""
     cfg = resolve_config(1, 128, dim=D, pe_dim=PE, num_slots=8192, block_size=64, max_pages=128)
     assert cfg["paged"] is True
-    assert cfg["block_N"] == 128
+    assert cfg["block_N"] == 64
+    assert cfg["chunk_d"] == 128
     assert cfg["num_split"] == 16
+    assert cfg["vector_mode"] == "simd_rc"
 
     cfg = resolve_config(1, 128, dim=D, pe_dim=PE, num_slots=256, block_size=64, max_pages=4)
     assert cfg["paged"] is True
-    assert cfg["num_split"] == 2  # 4 tiles of 128 tokens -> 2 splits
+    assert cfg["num_split"] == 4  # 4 tiles of 64 tokens -> 4 splits
 
 
 def test_resolve_rejects_mixed_geometry():
@@ -100,8 +104,9 @@ def test_dense_via_api_matches_reference():
         batch, heads, D, PE, kv_len=kv_len, softmax_scale=SCALE
     )
     assert run.paged is False
-    assert run.vector_mode == "simd_rc"
+    assert run.vector_mode == "simd"
     assert run.partial_dtype == "float32"
+    assert run.ml_width == 8
     q, q_pe, kv, k_pe = make_dense(batch, heads, kv_len, D, PE)
     out = run(q, q_pe, kv, k_pe)
     torch.npu.synchronize()
@@ -133,6 +138,7 @@ def test_paged_identity_table_matches_dense():
     )
     assert paged.paged is True
     assert paged.vector_mode == "simd_rc"
+    assert paged.block_N == 64
     out_dense = dense(q, q_pe, kv, k_pe)
     out_paged = paged(q, q_pe, kv.reshape(kv_len, D), k_pe.reshape(kv_len, PE), block_table, seqlens)
     torch.npu.synchronize()

@@ -47,21 +47,30 @@ until it divides the KV block count, and each split runs at least one KV block.
 import tilelang
 import tilelang.ascend.language as T
 
-ML_WIDTH = 32
+ML_WIDTH = 8
 
 
 def pick_tiling(kv_len, dim, block_N=None, chunk_d=None, merge_chunk_d=None):
     """Pick the measured-best tiling for a shape.
 
-    block_N=128 halves the per-KV-element vector traffic (one rescale/accumulate
-    pass per 128 columns instead of per 64), but the score tile grows to 32 KiB
-    and the kernel needs kv_len >= block_N. chunk_d=64 keeps the L0C/UB budget
-    inside the envelope at block_N=128; the merge tiles columns independently, so
-    it keeps 128-wide DMAs.
+    Defaults are the measured optimum after the SimdVF pass landed:
+    ``block_N=64, chunk_d=128``. Historically ``block_N=128`` was faster (fewer
+    rescale sweeps per KV element), but with the SimdVF rescale the 64-token tile
+    wins: it halves the score buffers, which frees UB for cross-stage overlap and
+    is the only tiling where the full-SIMD vector_mode fits at ``kv_len=8192``.
+    The merge tiles columns independently, so it keeps 128-wide DMAs.
     """
     if block_N is None:
-        block_N = 128 if kv_len >= 128 else 64
+        # Measured after the SimdVF pass landed: a 64-token score tile beats 128
+        # on the reference shape (68.8 -> 54.2 us e2e). The smaller tile halves
+        # the score buffers, which both frees UB for the scheduler to overlap
+        # more stages and is the only tiling where the full-SIMD `vector_mode`
+        # fits at kv_len=8192 (block_N=128 needs 222208 B > the 221184 B limit).
+        block_N = 64 if kv_len >= 64 else 32
     if chunk_d is None:
+        # Keep few, wide PV chunks: at block_N=64 this is 4 chunks per tile and
+        # measured ~16% faster than chunk_d=64 (8 chunks). The 128-token tile
+        # keeps 64 so its score/output staging stays inside L0C and UB.
         chunk_d = 64 if block_N >= 128 else 128
     if merge_chunk_d is None:
         merge_chunk_d = 128 if dim % 128 == 0 else chunk_d
@@ -89,13 +98,14 @@ def mla_decode_splitk_fwd(
     block_N=64,
     chunk_d=128,
     softmax_scale=None,
-    num_split=8,
+    num_split=16,
     threads=1024,
     num_stages=2,
     fuse_qk=True,
     fuse_rescale=True,
-    vector_mode="simd_rc",
+    vector_mode=None,
     partial_dtype="float32",
+    ml_width=ML_WIDTH,
 ):
     """Phase 1: per-split partial attention output + log-sum-exp.
 
@@ -105,17 +115,17 @@ def mla_decode_splitk_fwd(
     vmul + one vadd per 64 fp32 lanes instead of one scalar op per thread:
 
       "simt"     -- everything in ``T.SimtVF`` (the original kernel)
-      "simd_rc"  -- PV rescale/accumulate in ``T.SimdVF``  [default, see below]
+      "simd_rc"  -- PV rescale/accumulate in ``T.SimdVF``
       "simd_exp" -- exp + fp16 cast in ``T.SimdVF``
       "simd"     -- both of the above
 
-    Default is ``"simd_rc"``: it is the pass that both wins and fits the UB
-    budget. ``"simd_exp"``/``"simd"`` overflow UB at the benchmark shape
-    (``kv_len=8192``, ``block_N=128``, ``num_split=16`` ->
-    ``dyn_ubuf_bytes=222208`` > the 950PR limit, see the README's UB budget notes) because the
-    pipelined KV loop then double-buffers its score tile; they do run for
-    BPS<=1 shapes. Measured on the benchmark shape: e2e 78.94 -> 71.06 us
-    (-10.0%), rel error unchanged at 3.4e-04.
+    ``None`` (the default) resolves to ``"simd"`` for ``block_N <= 64`` and to
+    ``"simd_rc"`` for the 128-token tile: the SIMD exp pass overflowed UB at
+    ``kv_len=8192, block_N=128`` (``dyn_ubuf_bytes=222208`` against the 221184 B
+    limit), which is one of the reasons the default tiling moved to
+    ``block_N=64``. An explicit value always wins. Measured on the benchmark
+    shape with the default tiling: e2e 70.9 -> 54.2 us (-23.5%), rel error
+    unchanged at 3.4e-04.
 
     The SimdVF exp needs explicit MicroAPI intrinsics: ``AscendSimdVFLowerParallel``
     accepts only load/add/sub/mul/div/exp/log/sqrt/fabs inside a SimdVF block, so
@@ -148,6 +158,12 @@ def mla_decode_splitk_fwd(
     BPS = KV_BLOCKS // NS
     NUM_BLOCKS = batch * NUM_M_TILES * NS
 
+    # Auto mode: the full-SIMD pass (exp + rescale on the vector unit) is only
+    # known to fit the UB budget at block_N <= 64; the 128-token tile keeps the
+    # rescale-only pass. An explicit vector_mode= always wins.
+    if vector_mode is None:
+        vector_mode = "simd" if block_N <= 64 else "simd_rc"
+
     # A SimdVF pass holds 64 fp32 lanes per vector register, so the tiled axis
     # must be a whole number of registers; otherwise fall back to SimtVF.
     assert vector_mode in ("simt", "simd", "simd_exp", "simd_rc"), \
@@ -168,7 +184,7 @@ def mla_decode_splitk_fwd(
         KV: T.Tensor((batch, kv_len, dim), dtype),
         K_pe: T.Tensor((batch, kv_len, pe_dim), dtype),
         O_partial: T.Tensor((NS, batch, heads, dim), partial_dtype),
-        ML: T.Tensor((NS, batch, heads, ML_WIDTH), accum_dtype),
+        ML: T.Tensor((NS, batch, heads, ml_width), accum_dtype),
     ):
         with T.Kernel(NUM_BLOCKS) as bx:
             b = bx // (NUM_M_TILES * NS)
@@ -199,7 +215,7 @@ def mla_decode_splitk_fwd(
             # then reuses the same T.dual_copy shape as the num_split=1 kernel.
             o_ub = [T.alloc_shared((ROWS, chunk_d), accum_dtype) for _ in range(NUM_DC)]
             o_tmp_ub = T.alloc_shared((ROWS, chunk_d), accum_dtype)
-            ml_ub = T.alloc_shared((ROWS, ML_WIDTH), accum_dtype)
+            ml_ub = T.alloc_shared((ROWS, ml_width), accum_dtype)
             if partial_dtype != accum_dtype:
                 # fp16 publish staging, one output-column chunk at a time:
                 # ROWS * chunk_d * 2 B = 8 KiB at ROWS=64, chunk_d=64.
@@ -384,11 +400,11 @@ def mla_decode_splitk_fwd(
                     )
 
             with T.SimtVF(threads=threads):
-                for r, c in T.Parallel(ROWS, ML_WIDTH):
+                for r, c in T.Parallel(ROWS, ml_width):
                     ml_ub[r, c] = 0.0
                 for r in T.Parallel(ROWS):
                     ml_ub[r, 0] = m_ub[r] + T.log(l_ub[r])
-            T.dual_copy(ml_ub[0:ROWS, 0:ML_WIDTH], ML[sid, b, h0:h0 + block_H, 0:ML_WIDTH])
+            T.dual_copy(ml_ub[0:ROWS, 0:ml_width], ML[sid, b, h0:h0 + block_H, 0:ml_width])
 
     return main
 
@@ -538,7 +554,7 @@ def compile_mla_decode_splitk(
     block_N=None,
     chunk_d=None,
     softmax_scale=None,
-    num_split=8,
+    num_split=16,
     threads=1024,
     num_stages=2,
     fuse_qk=True,
@@ -546,8 +562,9 @@ def compile_mla_decode_splitk(
     merge_rows=16,
     merge_stages=4,
     merge_chunk_d=None,
-    vector_mode="simd_rc",
+    vector_mode=None,
     partial_dtype="float32",
+    ml_width=ML_WIDTH,
 ):
     """Compile both phases and return one callable with the baseline signature.
 
@@ -582,6 +599,7 @@ def compile_mla_decode_splitk(
             fuse_rescale=fuse_rescale,
             vector_mode=vector_mode,
             partial_dtype=partial_dtype,
+            ml_width=ml_width,
         ),
         out_idx=[4, 5],
     )
@@ -601,6 +619,7 @@ def compile_mla_decode_splitk(
             rows_per_block=merge_rows,
             num_stages=merge_stages,
             partial_dtype=partial_dtype,
+            ml_width=ml_width,
         ),
         out_idx=[2],
     )

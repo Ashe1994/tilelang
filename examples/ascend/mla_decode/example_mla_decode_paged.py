@@ -56,8 +56,8 @@ def mla_decode_paged_fwd(
     block_size,
     max_pages,
     block_H=128,
-    block_N=128,
-    chunk_d=64,
+    block_N=64,
+    chunk_d=128,
     softmax_scale=None,
     num_split=16,
     threads=1024,
@@ -372,7 +372,7 @@ def compile_mla_decode_paged(
     pe_dim,
     block_size,
     max_pages,
-    block_N=128,
+    block_N=64,
     chunk_d=None,
     softmax_scale=None,
     num_split=16,
@@ -385,8 +385,16 @@ def compile_mla_decode_paged(
     tiles_per_core=None,
     partial_dtype="float32",
     vector_mode="simd_rc",
+    ml_width=ML_WIDTH_PAGED,
 ):
     """Compile phase 1 + the shared merge kernel, return one callable.
+
+    Defaults are the measured optimum for the DeepSeek page geometry
+    (``block_size=64``): ``block_N=64`` (one page per tile), ``chunk_d=128`` and
+    ``vector_mode="simd_rc"``. The dense kernel's full-SIMD modes are rejected
+    here on purpose: a per-page score tile is only 64 columns wide, so the
+    explicit MicroAPI path measured no gain (phase 1 49.2 vs 49.1 us) and only
+    adds UB pressure.
 
     ``partial_dtype`` must be the same on both phases: the shared merge kernel
     declares the ``O_partial`` input with this dtype. The ``out_idx`` positions of
@@ -417,7 +425,7 @@ def compile_mla_decode_paged(
             threads=threads,
             num_stages=num_stages,
             fuse_rescale=fuse_rescale,
-            ml_width=ML_WIDTH_PAGED,
+            ml_width=ml_width,
             tiles_per_core=tiles_per_core,
             partial_dtype=partial_dtype,
             vector_mode=vector_mode,
@@ -438,7 +446,7 @@ def compile_mla_decode_paged(
             ns_explicit=num_split,
             rows_per_block=merge_rows,
             num_stages=merge_stages,
-            ml_width=ML_WIDTH_PAGED,
+            ml_width=ml_width,
             partial_dtype=partial_dtype,
         ),
         out_idx=[2],

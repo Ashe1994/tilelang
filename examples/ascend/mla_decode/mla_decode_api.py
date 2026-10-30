@@ -29,19 +29,23 @@ for either layout and only change the input tensors::
 
 Defaults, measured on Ascend 950PR (see ``README.md`` for the numbers):
 
-* ``block_N=128, chunk_d=64`` when the KV axis holds a 128-token tile, else
-  ``block_N=64, chunk_d=128`` for very short dense sequences.
+* ``block_N=64, chunk_d=128`` for both layouts: with the SimdVF rescale pass the
+  64-token score tile is ~20% faster than 128 and is the only tiling where the
+  full-SIMD vector mode fits the UB budget at long KV.
 * ``num_split=16`` (the measured optimum at ``kv_len=8192``); the split count is
   reduced to divide the KV block count (dense) or to the tile count implied by
   ``max_pages * block_size`` (paged), so short sequences do not pay for empty
   splits.
 * ``threads=1024``, ``num_stages=2`` for phase 1; ``merge_rows=16``,
   ``merge_stages=4`` for the merge kernel.
-* ``vector_mode="simd_rc"`` runs the PV rescale-accumulate pass in
-  ``T.SimdVF`` (register-level SIMD) instead of ``T.SimtVF``, which is the
-  measured-best phase-1 programming model on Ascend 950PR (e2e -10%); "simt"
-  restores the original thread-parallel code for A/B testing, and the stronger
-  dense-only modes are ``"simd_exp"``/``"simd"``.
+* ``vector_mode=None`` resolves to ``"simd"`` for the dense kernel at
+  ``block_N <= 64`` (exp/cast and rescale-accumulate both in ``T.SimdVF``), to
+  ``"simd_rc"`` for the 128-token dense tile (whose SIMD-exp form does not fit
+  the UB budget), and always to ``"simd_rc"`` for the paged kernel (a 64-column
+  page tile gives the explicit MicroAPI path nothing to amortise).
+  ``"simt"`` restores the original thread-parallel code for A/B testing.
+* ``ml_width=8`` is the row width of the ``ML`` staging tensor (only column 0 is
+  used; 8 fp32 = one 32 B DMA granule).
 * ``partial_dtype="float32"`` keeps the phase-1 -> phase-2 staging tensor in
   fp32; ``"float16"`` halves that traffic but measured no gain on Ascend 950PR
   (the merge is latency-, not byte-bound), so fp32 is the default.
@@ -60,9 +64,9 @@ from example_mla_decode_splitk import (
 # Measured-best split count for the long-KV shape; ``effective_split`` trims it
 # for shorter sequences.
 DEFAULT_NUM_SPLIT = 16
-# The paged kernel carries one score tile per page chunk; 128 is the measured
-# optimum for page sizes 16..128 on Ascend 950PR.
-DEFAULT_PAGED_BLOCK_N = 128
+# One 64-token score tile per page chunk is the measured optimum for the
+# DeepSeek page geometry on Ascend 950PR (see ``example_mla_decode_splitk``).
+DEFAULT_PAGED_BLOCK_N = 64
 
 
 def resolve_config(
@@ -89,7 +93,8 @@ def resolve_config(
     merge_chunk_d=None,
     tiles_per_core=None,
     partial_dtype="float32",
-    vector_mode="simd_rc",
+    vector_mode=None,
+    ml_width=8,
 ):
     """Resolve the dispatch and the measured-best defaults for a shape.
 
@@ -155,7 +160,16 @@ def resolve_config(
         "merge_stages": merge_stages,
         "tiles_per_core": tiles_per_core,
         "partial_dtype": partial_dtype,
-        "vector_mode": vector_mode,
+        "vector_mode": (
+            (
+                "simd"
+                if (not paged and tiling_block_N <= 64)
+                else "simd_rc"
+            )
+            if vector_mode is None
+            else vector_mode
+        ),
+        "ml_width": ml_width,
     }
 
 
@@ -183,14 +197,15 @@ def compile_mla_decode(
     merge_chunk_d=None,
     tiles_per_core=None,
     partial_dtype="float32",
-    vector_mode="simd_rc",
+    vector_mode=None,
+    ml_width=8,
 ):
     """Compile the MLA decode kernel best suited to the shape.
 
     The returned callable has the layout's signature -- ``run(q, q_pe, kv,
     k_pe)`` for dense and ``run(q, q_pe, kv, k_pe, block_table, cache_seqlens)``
     for paged -- and exposes ``paged``, ``num_split``, ``block_N``,
-    ``chunk_d``, ``partial_dtype`` and ``vector_mode`` for inspection.
+    ``chunk_d``, ``partial_dtype``, ``vector_mode`` and ``ml_width`` for inspection.
     """
     cfg = resolve_config(
         batch,
@@ -216,6 +231,7 @@ def compile_mla_decode(
         tiles_per_core=tiles_per_core,
         partial_dtype=partial_dtype,
         vector_mode=vector_mode,
+        ml_width=ml_width,
     )
 
     if cfg["paged"]:
@@ -240,6 +256,7 @@ def compile_mla_decode(
             tiles_per_core=cfg["tiles_per_core"],
             partial_dtype=cfg["partial_dtype"],
             vector_mode=cfg["vector_mode"],
+            ml_width=cfg["ml_width"],
         )
     else:
         run = compile_mla_decode_splitk(
@@ -261,6 +278,7 @@ def compile_mla_decode(
             merge_chunk_d=cfg["merge_chunk_d"],
             partial_dtype=cfg["partial_dtype"],
             vector_mode=cfg["vector_mode"],
+            ml_width=cfg["ml_width"],
         )
 
     run.paged = cfg["paged"]
@@ -269,5 +287,6 @@ def compile_mla_decode(
     run.chunk_d = cfg["chunk_d"]
     run.partial_dtype = cfg["partial_dtype"]
     run.vector_mode = cfg["vector_mode"]
+    run.ml_width = cfg["ml_width"]
     run.config = cfg
     return run

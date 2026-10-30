@@ -24,10 +24,10 @@ from test_mla_decode_paged import make_paged, ref_paged
 D, PE = 512, 64
 CASES = [
     # name, batch, seq_len, block_size, block_N, num_split
-    ("pg64_ns16_bn128", 1, 8192, 64, 128, 16),
-    ("pg128_ns16_bn128", 1, 8192, 128, 128, 16),
-    ("pg64_ns32_bn128", 1, 8192, 64, 128, 32),
-    ("pg64_ns8_bn128", 1, 8192, 64, 128, 8),
+    ("pg64_ns16_bn64", 1, 8192, 64, 64, 16),   # shipped default
+    ("pg128_ns16_bn64", 1, 8192, 128, 64, 16),
+    ("pg64_ns16_bn128", 1, 8192, 64, 128, 16),  # previous default (A/B)
+    ("pg64_ns32_bn64", 1, 8192, 64, 64, 32),
 ]
 
 

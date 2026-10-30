@@ -19,6 +19,12 @@ What it does, in ONE process so the two variants see the same load / clocks:
 
 Reference shape: B=1, H=128, S=8192, D=512, PE=64, num_split=16.
 
+Measured on 2026-10-30 with the vector-unit merge: fp16 partials are the dense
+default (phase 1 41.8 -> 39.3 us, merge reads 136 -> 72 KB/block), while the
+paged kernel keeps fp32 because its column-sliced fp16 publish measured slower
+(57.0 -> 59.4 us; a full-width staging buffer starves the auto-scheduler and
+lands at 68.7 us). Run this script before changing either default.
+
     flock -w 5400 /dev/shm/mla_bench.lock -c 'python bench_partial_dtype.py'
 
 Only ``backend="event"`` is used: msprof_detail undercounts a two-kernel e2e

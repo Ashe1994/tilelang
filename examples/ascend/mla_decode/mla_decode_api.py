@@ -46,9 +46,15 @@ Defaults, measured on Ascend 950PR (see ``README.md`` for the numbers):
   ``"simt"`` restores the original thread-parallel code for A/B testing.
 * ``ml_width=8`` is the row width of the ``ML`` staging tensor (only column 0 is
   used; 8 fp32 = one 32 B DMA granule).
-* ``partial_dtype="float32"`` keeps the phase-1 -> phase-2 staging tensor in
-  fp32; ``"float16"`` halves that traffic but measured no gain on Ascend 950PR
-  (the merge is latency-, not byte-bound), so fp32 is the default.
+* ``merge_vector_mode="simd"`` runs the merge kernel's per-split accumulate and
+  final normalisation on the vector unit (``T.SimdVF``); measured merge
+  13.9 -> 9.1 us (-34.6%, e2e -14.3% together with the fp16 partials).
+  ``"simt"`` restores the original thread-parallel merge for A/B.
+* ``partial_dtype="float16"`` (default) halves the phase-1 -> phase-2 staging
+  traffic; the partials are normalised inside the split, so the fp16 round trip
+  costs ~1 fp16 epsilon (rel 3.8e-4 against the 1e-2 tolerance) and measured
+  phase 1 41.8 -> 39.3 us plus merge 13.9 -> 9.1 us with the widening path.
+  ``"float32"`` is the reference path.
 
 ``resolve_config`` performs the dispatch and defaulting without touching the
 device, which keeps the policy unit-testable.
@@ -92,9 +98,10 @@ def resolve_config(
     merge_stages=4,
     merge_chunk_d=None,
     tiles_per_core=None,
-    partial_dtype="float32",
+    partial_dtype=None,
     vector_mode=None,
     ml_width=8,
+    merge_vector_mode="simd",
 ):
     """Resolve the dispatch and the measured-best defaults for a shape.
 
@@ -159,7 +166,6 @@ def resolve_config(
         "merge_rows": merge_rows,
         "merge_stages": merge_stages,
         "tiles_per_core": tiles_per_core,
-        "partial_dtype": partial_dtype,
         "vector_mode": (
             (
                 "simd"
@@ -170,6 +176,12 @@ def resolve_config(
             else vector_mode
         ),
         "ml_width": ml_width,
+        "merge_vector_mode": merge_vector_mode,
+        "partial_dtype": (
+            ("float32" if paged else "float16")
+            if partial_dtype is None
+            else partial_dtype
+        ),
     }
 
 
@@ -196,16 +208,18 @@ def compile_mla_decode(
     merge_stages=4,
     merge_chunk_d=None,
     tiles_per_core=None,
-    partial_dtype="float32",
+    partial_dtype=None,
     vector_mode=None,
     ml_width=8,
+    merge_vector_mode="simd",
 ):
     """Compile the MLA decode kernel best suited to the shape.
 
     The returned callable has the layout's signature -- ``run(q, q_pe, kv,
     k_pe)`` for dense and ``run(q, q_pe, kv, k_pe, block_table, cache_seqlens)``
     for paged -- and exposes ``paged``, ``num_split``, ``block_N``,
-    ``chunk_d``, ``partial_dtype``, ``vector_mode`` and ``ml_width`` for inspection.
+    ``chunk_d``, ``partial_dtype``, ``vector_mode``, ``ml_width`` and
+    ``merge_vector_mode`` for inspection.
     """
     cfg = resolve_config(
         batch,
@@ -232,6 +246,7 @@ def compile_mla_decode(
         partial_dtype=partial_dtype,
         vector_mode=vector_mode,
         ml_width=ml_width,
+        merge_vector_mode=merge_vector_mode,
     )
 
     if cfg["paged"]:
@@ -257,6 +272,7 @@ def compile_mla_decode(
             partial_dtype=cfg["partial_dtype"],
             vector_mode=cfg["vector_mode"],
             ml_width=cfg["ml_width"],
+            merge_vector_mode=cfg["merge_vector_mode"],
         )
     else:
         run = compile_mla_decode_splitk(
@@ -279,6 +295,7 @@ def compile_mla_decode(
             partial_dtype=cfg["partial_dtype"],
             vector_mode=cfg["vector_mode"],
             ml_width=cfg["ml_width"],
+            merge_vector_mode=cfg["merge_vector_mode"],
         )
 
     run.paged = cfg["paged"]
@@ -288,5 +305,6 @@ def compile_mla_decode(
     run.partial_dtype = cfg["partial_dtype"]
     run.vector_mode = cfg["vector_mode"]
     run.ml_width = cfg["ml_width"]
+    run.merge_vector_mode = cfg["merge_vector_mode"]
     run.config = cfg
     return run

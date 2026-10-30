@@ -33,8 +33,8 @@ NS = 16
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--which", default="phase1", choices=["phase1", "e2e"])
-    ap.add_argument("--block-n", type=int, default=128)
-    ap.add_argument("--chunk-d", type=int, default=64)
+    ap.add_argument("--block-n", type=int, default=64)
+    ap.add_argument("--chunk-d", type=int, default=128)
     args = ap.parse_args()
 
     scale = (D + PE) ** -0.5

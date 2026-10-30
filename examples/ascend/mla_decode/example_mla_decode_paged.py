@@ -67,6 +67,7 @@ def mla_decode_paged_fwd(
     tiles_per_core=None,
     partial_dtype="float32",
     vector_mode="simd_rc",
+    stage_cols=None,
 ):
     """Phase 1: per-split partial output + log-sum-exp over a paged KV cache.
 
@@ -101,13 +102,13 @@ def mla_decode_paged_fwd(
     NUM_BLOCKS = batch * NUM_M_TILES * NS
 
     # fp16 publish staging width, in output columns. The dense kernel can afford a
-    # full-width [ROWS, chunk_d] fp16 staging buffer; this kernel cannot: at
-    # block_N=128 it already occupies 216064 B of the ~220 KiB dynamic UBUF that
-    # is left after the 32 KiB SIMT reservation of the 248 KiB dav-3510 UB pool,
-    # and an extra 8 KiB buffer makes aclrtLaunchKernel reject the launch
-    # ("dynamicShareMemSize is invalid"). 32 columns x ROWS x 2 B = 4 KiB fits, so
-    # the fp16 publish streams each output-column chunk in column slices.
-    STAGE_COLS = min(chunk_d, 32)
+    # full-width [ROWS, chunk_d] fp16 staging buffer; this paged kernel cannot:
+    # the full-width 16 KiB buffer leaves the auto-scheduler no UB headroom to
+    # multi-buffer phase 1 (e2e 57.0 -> 68.7 us), and even 32-column slices are
+    # slower than writing fp32 (57.0 -> 59.4 us). fp32 therefore stays this
+    # kernel's default and the fp16 path is only for callers that want the merge
+    # traffic halved; ``stage_cols`` overrides the slice width for experiments.
+    STAGE_COLS = min(chunk_d, 32) if stage_cols is None else min(stage_cols, chunk_d)
     NUM_SLICES = chunk_d // STAGE_COLS
 
     # pages per tile, and the rows of a tile that each page contributes
@@ -386,6 +387,8 @@ def compile_mla_decode_paged(
     partial_dtype="float32",
     vector_mode="simd_rc",
     ml_width=ML_WIDTH_PAGED,
+    merge_vector_mode="simd",
+    stage_cols=None,
 ):
     """Compile phase 1 + the shared merge kernel, return one callable.
 
@@ -429,6 +432,7 @@ def compile_mla_decode_paged(
             tiles_per_core=tiles_per_core,
             partial_dtype=partial_dtype,
             vector_mode=vector_mode,
+            stage_cols=stage_cols,
         ),
         out_idx=[6, 7],
     )
@@ -448,6 +452,7 @@ def compile_mla_decode_paged(
             num_stages=merge_stages,
             ml_width=ml_width,
             partial_dtype=partial_dtype,
+            merge_vector_mode=merge_vector_mode,
         ),
         out_idx=[2],
     )

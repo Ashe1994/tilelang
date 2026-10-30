@@ -30,7 +30,7 @@ NS = 16
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--block-size", type=int, default=64)
-    ap.add_argument("--block-n", type=int, default=128)
+    ap.add_argument("--block-n", type=int, default=64)
     ap.add_argument("--num-split", type=int, default=NS)
     args = ap.parse_args()
 

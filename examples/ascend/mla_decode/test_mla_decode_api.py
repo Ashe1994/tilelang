@@ -36,6 +36,7 @@ def test_resolve_dense_defaults():
     assert cfg["merge_chunk_d"] == 128
     assert cfg["vector_mode"] == "simd"
     assert cfg["ml_width"] == 8
+    assert cfg["partial_dtype"] == "float16"  # dense uses fp16 partials
 
     cfg = resolve_config(1, 128, dim=D, pe_dim=PE, kv_len=64)
     assert cfg["block_N"] == 64
@@ -55,6 +56,7 @@ def test_resolve_paged_defaults():
     assert cfg["chunk_d"] == 128
     assert cfg["num_split"] == 16
     assert cfg["vector_mode"] == "simd_rc"
+    assert cfg["partial_dtype"] == "float32"  # paged fp16 publish measured slower
 
     cfg = resolve_config(1, 128, dim=D, pe_dim=PE, num_slots=256, block_size=64, max_pages=4)
     assert cfg["paged"] is True
@@ -105,8 +107,9 @@ def test_dense_via_api_matches_reference():
     )
     assert run.paged is False
     assert run.vector_mode == "simd"
-    assert run.partial_dtype == "float32"
+    assert run.partial_dtype == "float16"
     assert run.ml_width == 8
+    assert run.merge_vector_mode == "simd"
     q, q_pe, kv, k_pe = make_dense(batch, heads, kv_len, D, PE)
     out = run(q, q_pe, kv, k_pe)
     torch.npu.synchronize()

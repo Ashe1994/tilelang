@@ -33,7 +33,7 @@ test_mla_decode_coverage.py      # dense gaps: batch=16, dim/pe combinations, lo
 test_mla_decode_api.py           # dispatch/defaulting policy, no device required
 bench/bench_default.py           # dense baseline vs shipped defaults (correctness + latency)
 bench/bench_paged.py             # paged page sizes vs dense, with a correctness guard
-bench/bench_partial_dtype.py     # A/B of O_partial fp32 vs fp16 (measured: no gain)
+bench/bench_partial_dtype.py     # A/B of O_partial fp32 vs fp16 (dense ships fp16, paged fp32)
 bench/prof_*.py, bench/parse_pipes.py  # single-kernel msprof captures + CSV summary; see bench/README.md
 ```
 
@@ -50,10 +50,11 @@ calls.
 `mla_decode_api.compile_mla_decode()` selects the kernel and the measured-best
 tiling from the shape; the caller only changes the input tensors between the two
 layouts. For the dense reference shape it resolves to `block_N=64`, `chunk_d=128`,
-`num_split=16`, `vector_mode="simd"` and `ml_width=8`. `resolve_config()` returns
-the same decision as a dict without touching the device, and the returned callable
-exposes its decision (`paged`, `num_split`, `block_N`, `chunk_d`,
-`partial_dtype`, `vector_mode`, `ml_width`).
+`num_split=16`, `vector_mode="simd"`, `merge_vector_mode="simd"`,
+`partial_dtype="float16"` and `ml_width=8`. `resolve_config()` returns the same
+decision as a dict without touching the device, and the returned callable exposes
+its decision (`paged`, `num_split`, `block_N`, `chunk_d`, `partial_dtype`,
+`vector_mode`, `merge_vector_mode`, `ml_width`).
 
 ```python
 import math
@@ -102,10 +103,13 @@ cross-core barrier: a barrier has to be reached by every core, which serialises
 the combine behind the slowest split and still round-trips the partials through
 GM.
 
-Phase 1 writes `O_partial`, a `[num_split, batch, heads, dim]` fp32 tensor. The
-fp32 round trip is deliberate - the partials are unnormalised, so fp16 would lose
-accuracy before the merge - and it costs 64 MiB in the worst measured shape
-(`batch=16, num_split=16`). Next to it, `ML` is a `[num_split, batch, heads,
+Phase 1 writes `O_partial`, a `[num_split, batch, heads, dim]` staging tensor whose
+element type is `partial_dtype` (dense defaults to `"float16"`, paged to
+`"float32"`). The partials are normalised inside the split, so an fp16 round trip
+costs about one fp16 epsilon (3.8e-4 relative against the 1e-2 tolerance) while
+halving the staging traffic - 32 MiB instead of 64 MiB at
+`batch=16, num_split=16`; paged keeps fp32 because fp16 measured slower there.
+Next to it, `ML` is a `[num_split, batch, heads,
 ml_width]` fp32 tensor whose column 0 holds `lse`. `ml_width=8` is one 32 B DMA
 granule: `T.dual_copy` moves the two AIV halves of the M axis in one DMA, and a
 1-wide region is not a useful transfer shape. The width is a parameter because it
@@ -119,7 +123,8 @@ The merge took the same treatment as phase 1. One block per `dim/chunk_d` column
 chunk is only 4 blocks for the reference shape, so the split loop was latency
 bound; `rows_per_block=16` splits the 128-row head block across 8x more blocks
 and `num_stages=4` pipelines the split loop. Measured: 85.2 us (rows=128,
-stages=1) -> 37.0 -> 21.1 -> **14.3 us** (rows=16, stages=4).
+stages=1) -> 37.0 -> 21.1 -> **14.3 us** (rows=16, stages=4); the SIMD passes and
+fp16 partials then take it to **9.1 us** (see Performance).
 
 ## Vector programming model
 
@@ -143,8 +148,9 @@ tilings keep working.
 Two steps were measured. First, `"simd_rc"` at the old 128-token tile took the
 reference shape from 78.9 to 70.8 us (-10.2%), relative error unchanged at 3.4e-4.
 Second, once the tile was retuned to 64 tokens (next section) the full-SIMD mode
-fits the UB budget and takes the same shape to **54.2 us**. What blocks `simd_exp`
-at 128 tokens is exactly the score-tile double buffering:
+fits the UB budget and takes the same shape to 54.2 us - and 46.4 us once the
+merge kernel's SIMD passes and fp16 partials follow (see Performance). What blocks
+`simd_exp` at 128 tokens is exactly the score-tile double buffering:
 `dyn_ubuf_bytes = 222208 > 221184`.
 
 The paged kernel accepts only `"simt"` and `"simd_rc"`, and passing `"simd"`
@@ -152,6 +158,11 @@ explicitly fails its assert with a clear message rather than being silently
 downgraded. The reason is that a per-page score tile is only 64 columns wide, so
 the explicit MicroAPI path cannot amortise its setup: it measured no gain
 (phase 1 49.2 vs 49.1 us) and only adds UB pressure.
+
+The merge kernel has its own switch, `merge_vector_mode`: `"simd"` (default) runs
+both the per-split accumulate and the final normalisation in `T.SimdVF`,
+`"simd_acc"` moves only the accumulate, and `"simt"` is the original thread
+version. See Configuration and defaults.
 
 ## Why `block_N=64` (tiling re-tune)
 
@@ -168,13 +179,16 @@ compiler's automatic pipeline overlap stages), and only `block_N=64` lets
 
 | Change | e2e (us) |
 | --- | ---: |
-| `block_N=128`, `"simd_rc"` (old default) | ~70.6 |
-| `block_N=64`, `"simd"` (**new default**) | **54.2** |
+| `block_N=128`, `"simd_rc"` (older default) | ~70.6 |
+| `block_N=64`, `"simd"` (default after the tiling round) | **54.2** |
 
-Around the new point: `chunk_d=128` is ~16% faster than `chunk_d=64` (fewer, wider
+Around that point: `chunk_d=128` is ~16% faster than `chunk_d=64` (fewer, wider
 PV chunks), `num_split=16` stays optimal (`ns=8` is +41%, `ns=32` is +39%), and
 `num_stages=2` stays optimal (`3` is +2.2%, `4` is +7.4%). `kv_len < 64` falls
 back to `block_N=32`, where every SIMD pass drops back to `T.SimtVF`.
+
+The current default goes further (46.4 us) once the merge's SIMD passes and fp16
+partials are included - see Performance.
 
 ## Paged KV cache
 
@@ -263,8 +277,9 @@ Environment: Ascend 950PR (`ASCEND_RT_VISIBLE_DEVICES=6`), CANN 9.3.0, tilelang
 Shape `batch=1, heads=128, kv_len=8192, dim=512, pe_dim=64`, FLOPs
 `2*b*h*s*(dim+pe_dim) + 2*b*h*s*dim = 2.2817 GFLOP`. Timings are wall clock with
 `do_bench(backend="event")`, median of 3-5 rounds, spread <= 0.3 us. The round 1-4
-history was collected at load below 60, the SimdVF/fp16-partial A/B at load
-90-120, and the final `block_N=64` numbers at load 27-45 (dense) / 22.9 (paged).
+history was collected at load below 60, the SimdVF/fp16-partial A/B at load 90-120,
+and the current numbers at load 22-36. The baseline re-measured 1549.5 us; 1549.3
+is used for every speedup so the column stays consistent across rounds.
 
 | Step | e2e (us) | phase 1 | merge | Speedup | TFLOPS |
 |---|---:|---:|---:|---:|---:|
@@ -274,112 +289,162 @@ history was collected at load below 60, the SimdVF/fp16-partial A/B at load
 | + `block_N=128` / `chunk_d=64`, decoupled merge, `threads=1024` | 78.9 | 66.2 | 14.4 | 19.64x | 28.92 |
 | + merged exp/fp16-cast pass | 78.4 | 63.5 | 14.4 | 19.76x | 29.09 |
 | + SimdVF rescale/accumulate (`block_N=128`) | 70.8 | 58.4 | 14.4 | 21.9x | 32.3 |
-| + 64-token score tile + full-SIMD vector mode (**current default**) | **54.2** | **41.9** | **14.3** | **28.6x** | **42.1** |
+| + 64-token score tile + full-SIMD vector mode (previous default) | 54.2 | 41.9 | 14.3 | 28.6x | 42.1 |
+| + merge SimdVF + fp16 partials (**current default**) | **46.4** | **39.3** | **9.1** | **33.4x** | **49.2** |
 
-The current default was measured three times independently at 54.09, 54.22 and
-54.47 us (load 27-45); the previous `block_N=128` default measured 70.4-70.9 us.
-Phase 1 and merge are independent single-kernel measurements; the shared merge
-kernel contributes 14.3 us, so phase 1 alone is 41.9 us (dense) and 49.1 us
-(paged, page 64).
+The current default was measured at load 22-36. Phase 1 and merge are independent
+single-kernel measurements: phase 1 alone is 39.3 us (dense) / 47.8 us (paged,
+page 64) and the shared merge contributes 9.1 us. The previous default had been
+measured three times at 54.09 / 54.22 / 54.47 us.
 
-Paged, same shape and the new `block_N=64` / `chunk_d=128` default, measured in
-the same process as the dense number above:
+Paged, same shape and the same `block_N=64` / `chunk_d=128` phase-1 tiling,
+measured in the same process as the dense number above:
 
 | Page size | e2e (us) | phase 1 (us) | TFLOPS | vs dense |
 |---|---:|---:|---:|---:|
-| **64 (recommended)** | **61.4** | **49.1** | **37.2** | **1.13x slower** |
-| 16 / 32 / 128 | - | - | - | not re-swept |
+| **64 (recommended)** | **57.3** | **47.8** | **39.8** | **1.23x slower** |
+| 128 | 57.3 | - | 39.8 | same as page 64 |
+| 16 / 32 | - | - | - | not re-swept |
 
-Page sizes 16/32/128 were measured under the previous `block_N=128` default
-(99.0 / 77.4 / 75.0 us) and were not re-swept after the tiling change.
+Paged now runs the `merge_vector_mode="simd"` merge but keeps
+`partial_dtype="float32"`: the fp16 partial path measured slower there (see Known
+limitations). Page 64 and page 128 are identical at 57.3 us; the previous
+`block_N=128` default measured 61.1 us and `num_split=32` 74.5 us.
 
 `page_size=64` is both the DeepSeek cache geometry and the measured optimum: it
 matches the 64-token tile, and two 64-wide score tiles keep the QK product as
 independent GEMM chains. Against the `num_split=1` baseline, paged at page 64 is
-25.2x. The tiling re-tune and the full-SIMD mode helped the dense kernel more than
-paged - the paged kernel caps at `"simd_rc"` and a per-page score tile is only 64
-columns wide - so the ordering flipped: paged was 5% faster than dense at
-`block_N=128` and is now 13% slower, while still gaining 6% over its own previous
-default.
+27.0x. The dense kernel gained more from this round (fp16 partials pay off there,
+while merge SimdVF lifts both layouts equally), so paged moved from 1.13x to 1.23x
+slower than dense.
 
 The first paged version was 93.9 us (19% slower than dense). The fix was to
 accumulate both pages' PV into the same `o_l0c` (`clear_accum=False`): the GEMM
 count stays at 16 per tile but `dual_copy` and the UB accumulate drop from 16 to
 8, and the profiler's doubled `fixpipe` share disappeared exactly as predicted.
 
-## Pipeline
+## Profile (msprof)
 
-msprof `op` with the 8-CSV set, one kernel per capture (`--warm-up=10
---launch-count=5`), Ascend 950PR at 1650/1650 MHz.
-`ratio` is busy cycles over that core's own cycles; AIC and AIV run concurrently,
-so the two groups do not add up, and pipes within a group overlap.
+One kernel per capture, so every capture attributes a single launch. All numbers
+below come from
 
-| Metric | dense | paged, page 64 | paged, page 128 | merge |
-|---|---:|---:|---:|---:|
-| Task duration (us) | 63.5 | **56.8** | 64.0 | 12.9 |
-| AIC cube (MAD) | 16.6% | **18.6%** | 16.5% | - |
-| AIC mte2 (GM->L1) | 20.2% | 23.2% | 23.4% | - |
-| AIC fixpipe (L0C->UB) | 6.6% | 7.7% | 6.5% | - |
-| AIV vec | 77.2% | **72.2%** | 77.4% | **91.0%** |
-| AIV mte2 (GM->UB) | 0% | 0% | 0% | **69.9%** |
-| Achieved compute | 36.0 TFLOPS (8.3%) | 40.2 TFLOPS (9.3%) | 35.7 TFLOPS (8.3%) | - |
-| Aggregate GM bandwidth | 318 GB/s (8.0%) | 356 GB/s (8.9%) | 316 GB/s (7.9%) | - |
-| `aiv_vec_wait` | 88.9% | 87.4% | 89.6% | 89.6% |
-| `aic_cube_wait` | 95.8% | 88.0% | 96.7% | - |
+```bash
+msprof op --warm-up=10 --launch-count=5 \
+    --aic-metrics=PipeUtilization,Memory,MemoryL0,L2Cache,ResourceConflictRatio \
+    --output=/dev/shm/opp_dense \
+    python examples/ascend/mla_decode/bench/prof_phase1.py --which phase1
+python examples/ascend/mla_decode/bench/parse_pipes.py dense=/dev/shm/opp_dense
+```
 
-The captures predate both SimdVF passes and the tiling re-tune (dense phase 1 is
-63.5 us here against 41.9 us now, paged page 64 56.8 against 49.1), so the shares
-are used for attribution rather than as current latencies.
+All five metric groups are required: `parse_pipes.py` reads `PipeUtilization`,
+`Memory`, `MemoryL0`, `L2Cache` and `ResourceConflictRatio` to print per-pipe busy
+time, wait ratios, the L2 read hit rate, GM->L1 and GM->UB traffic with bandwidth
+usage, L0 bandwidth and the MTE instruction counts. Write captures to `/dev/shm`
+(or a data partition) - a full root partition fails the capture. `ratio` is busy
+cycles over that core's own cycles, and AIC/AIV are separate cores running
+concurrently, so the two groups do not add up.
 
-Neither variant is compute bound nor bandwidth bound: the cube is busy 16-19% of
-the duration and the memory system is at 8-9% of its peak. The vector pipeline
-owns 72-91% of the duration and waits 87-90% of its cycles. The root cause is the
-**six-stage serial dependency per KV tile**: `QK -> dual_copy -> softmax ->
-dual_copy -> PV -> dual_copy`. A tile takes about 15.9 us of which the cube has
-about 2.6 us of real work, so deepening the pipeline cannot close the gap
-(`num_stages=3` measured 14% slower at the old tile, `num_split=8` 21% slower than
-16); the lever that did work was shrinking the tile, which lowers the UB pressure
-that the scheduler is fighting (see the `block_N=64` section).
+### Dense phase 1: previous -> current default
+
+| Metric | previous | current |
+|---|---:|---:|
+| Task duration | 39.9 us | **38.3 us** |
+| AIC cube (MAD) | 10.55 us (26.5%) | 10.55 us (27.6%) |
+| AIC mte2 (GM->L1) | 14.37 us | 15.44 us |
+| AIC mte1 (L1->L0) | 7.75 us | 7.79 us |
+| AIC fixpipe (L0C->UB) | 9.07 us | 9.05 us |
+| AIV vec | 22.16 us | **20.77 us** |
+| `aic_cube_wait` | 95.8% | **96.4%** |
+| `aiv_vec_wait` | 84.0% | **97.0%** |
+| `aic_mte2_wait` | 32.2% | 32.1% |
+| L2 read hit | 41.6% | **53.3%** |
+| GM->L1 traffic | 1232 KB/block | 1232 KB/block |
+| Pipe bandwidth / main-memory read | 18.9% / 31 GB/s per block | same |
+| MTE2 instructions | 102 | 102 |
+| Achieved compute | - | **59.6 TFLOPS (13.8%)** |
+| Aggregate GM bandwidth | - | **527 GB/s (13.2%)** |
+
+### Paged phase 1 (page 64)
+
+| Metric | value |
+|---|---:|
+| Task duration | 47.8 us (47.7 us before this round) |
+| AIC cube (MAD) | 10.55 us |
+| AIC mte2 (GM->L1) | 13.30 us (27.8%) |
+| AIC fixpipe (L0C->UB) | 6.75 us |
+| AIV vec | 28.02 us (58.7%) |
+| `aic_mte2_wait` | **61.5%** (dense: 32.1%) |
+| MTE2 instructions | **166** (dense: 102) |
+| L2 read hit | 53.4% |
+| Achieved compute | 47.8 TFLOPS (11.1%) |
+| Aggregate GM bandwidth | 423 GB/s (10.6%) |
+
+### Merge: previous -> current default
+
+| Metric | previous | current |
+|---|---:|---:|
+| Task duration | 13.3 us | **8.5 us** |
+| AIV vec | 10.98 us | **4.92 us** |
+| AIV mte2 (GM->UB) | 8.84 us | **3.94 us** |
+| GM->UB traffic | 136 KB/block | **72 KB/block** (fp16 partials) |
+| `aiv_vec_wait` / `aiv_mte2_wait` | 88.3% / 91.7% | 82.3% / 82.8% |
+| Effective bandwidth | 345 GB/s | 293 GB/s (7.3%) |
+
+### What the profile says
+
+None of the three kernels is close to saturated: compute is 11-14% of the 432
+TFLOPS peak and bandwidth 7-13% of 4 TB/s. The dense phase-1 bound is the
+dependency chain - `aic_cube_wait` 96.4% and `aiv_vec_wait` 97.0% - and the ideal
+overlap bound is `max(cube 10.55, mte2 15.44, vec 20.77) = 20.8 us` against the
+38.3 us measured. Paged is further from its own bound because of data movement:
+**166 MTE2 instructions per block against dense's 102**, and `aic_mte2_wait` 61.5%
+against 32.1%. Merge is the one kernel that is close to its own limit now (8.5 us
+with vec 4.92 us and mte2 3.94 us).
+
+The root cause is the **six-stage serial dependency per KV tile**:
+`QK -> dual_copy -> softmax -> dual_copy -> PV -> dual_copy`, and no amount of
+pipeline depth closes it (`num_stages=3` was 14% slower at the old tile,
+`num_split=8` 21% slower than 16).
 
 Ceilings already checked, so they are not worth retrying: `block_N=256` exceeds
 L0C, `block_H=256` exceeds UB, larger `num_split` leaves too few tiles per core
 to fill the pipeline, and the two-pass max-then-accumulate softmax removes only
 12% of the vector work while adding a second KV read and a second QK pass.
 
-The profile pointed at three levers; two have since been taken and one is still
-open:
+The three levers the first profile pointed at have now been worked through:
 
-1. **SimtVF -> SimdVF (done, in two steps).** `aiv_vec_simt_vf_ratio = 0.78`
-   against 0.005 for pure SIMD meant 78% of vector time ran in the SIMT thread
-   model. Moving the PV rescale-accumulate to `T.SimdVF` (`"simd_rc"`) took the
-   reference shape 78.9 -> 70.8 us (-10.2%); retuning the tile to 64 tokens then
-   let the exp/cast pass move too (`"simd"`), taking it to 54.2 us. The exp pass
-   is UB-blocked only at `block_N=128`.
-2. **fp16 `O_partial` (tried, no gain).** Halving the merge read from 4 MiB to
-   2 MiB left the merge time unchanged (-0.23 / +0.04 us across two A/B rounds)
-   and end-to-end 0.4-0.7 us slower: the merge is latency bound, not byte bound
-   (`AIV vec` is 91.0% of its duration against `mte2` 69.9%), and the extra
-   fp16-to-fp32 cast in the accumulate cancels the narrower read.
-   `partial_dtype="float16"` stays as an opt-in knob (verified to rel <= 5.3e-4);
-   `"float32"` is the default.
-3. **Read the KV once (open).** `read_main_memory_datas` measures 1232 KiB per
-   tile, which is the KV data twice (once as K for QK, once transposed as V for
-   PV). Loading it into UB once and splitting into `k_l1`/`v_l1T` would halve the
-   GM read and lift the 53% L2 read hit rate.
+1. **SimtVF -> SimdVF (done).** `aiv_vec_simt_vf_ratio = 0.78` against 0.005 for
+   pure SIMD meant 78% of vector time ran in the SIMT thread model. The phase-1
+   rescale, then the exp/cast pass, then the merge's accumulate and normalise
+   passes all moved to `T.SimdVF`: 78.9 -> 54.2 us over the first two steps and
+   46.4 us once the merge passes followed.
+2. **fp16 `O_partial` (done for dense, rejected for paged).** Halving the staging
+   traffic was worth nothing on its own (the merge was latency bound), but with
+   the merge's fp16 widening path the merge drops to 9.1 us and the dense
+   end-to-end by another ~8 us; the same change measured *slower* on paged, so
+   paged keeps fp32 (see Known limitations).
+3. **Read the KV once (ruled out).** The KV is read twice per tile - once as K
+   for QK, once transposed as V for PV, 1232 KB/block. The obvious fix (stage the
+   KV in UB once, then write both L1 operands) is blocked by the copy API: a
+   `T.copy` from UB to L1 compiles but silently ignores `transpose=True`, a raw
+   UB->L1 copy does not produce the NZ layout a GEMM needs, and an L1->L1
+   transpose does not compile (no DMAPath). The double read has no replacement in
+   this release.
 
-The dependency chain itself is untouched - `aiv_vec_wait` was ~87% in the
-pre-change capture - so the remaining large win is structural: fewer stages per
-tile, or overlapping the softmax of one block with the PV of the previous one.
-Tiling itself is exhausted, and cross-block software pipelining is blocked by the
-scheduler (next section).
+The dependency chain is what remains: `aic_cube_wait` 96.4% and `aiv_vec_wait`
+97.0% in the current profile. The remaining large win is structural - fewer
+stages per tile, or overlapping the softmax of one block with the PV of the
+previous one - and cross-block software pipelining is blocked by the scheduler
+(next section).
 
 ## Pipeline / multi-buffer experiments (negative results)
 
 Manual software pipelining across KV blocks is the obvious next step once the
 profile showed the six-stage dependency, so it was attempted from several angles
-and failed. The experimental switches live only in the experiment trees - nothing
-from this section was merged into the deliverable, which is why the file list does
-not change.
+and failed. The pipeline/multi-buffer switches live only in the experiment trees -
+none of them was merged, which is why the file list does not change (the
+merge-SIMD and fp16-partial work is a separate, shipped change; see Vector
+programming model).
 
 **The hard limit is L1 capacity.** A core has 512 KiB of L1, and at `block_N=128`
 the phase-1 buffers already take
@@ -407,13 +472,41 @@ instead of being traded off:
 | `{s_ub: 2, o_tmp: 2}` | Z3 compile-time failure: `capacity is negative (-8704)` |
 | paged `score_versions=2` | `scope "shared" capacity 40448 insufficient for minimum buffer usage 41344` (896 B short) |
 | `annotate_unlimit_memory` | Z3 goes unsat and degrades to a topological sort: UB 238592 over the limit, time unchanged |
-| `num_stages = 3 / 4` | at `block_N=64` no gain (paged 61.4-61.8 us, inside the noise) |
+| `num_stages = 3 / 4` | at `block_N=64` no gain (paged 61.4-61.8 us at the time, inside the noise) |
 | merge `rows_per_block` / `num_stages` / `threads` | fully swept; `rows=16, stages=4, threads=256` best at 14.34 us |
 | merge 2 / 4 partial accumulators | +1.6% / +3.8% (worse) |
+| dense `pipeline=20` (`T.Stage`, 4-stage manual pipeline) | -1.3%, target not met; not merged - the shipped kernel's device source is byte-identical to the non-pipeline build (`pipeline=0`) |
+| paged, OOB clamp/fill removed | MTE2 instructions 166 -> 102, but `aic_mte2_wait` 61.2% -> 75.9% and the duration rose: worse |
+| paged, compile-time trip count | same direction as above: worse |
+| paged, affine page fast path | measured upside 0; dropped from the backlog |
 
 Cross-KV-block software pipelining is therefore infeasible on this compiler (the
-Z3 in-loop UB budget model) rather than merely untuned; the leverage is the tile
-size, which lowers the UB pressure (see the `block_N=64` section).
+Z3 in-loop UB budget model) rather than merely untuned, and the manual-pipeline
+line is closed: neither the automatic nor a hand-written pipeline can fit the
+`block_N=128` L1 footprint. The leverage is the tile size, which lowers the
+UB/L1 pressure (see the `block_N=64` section).
+
+## Configuration and defaults
+
+Everything is a keyword argument on the API entry point and on the kernel
+builders. The table is the measured-best set for the reference shape, i.e. what
+`compile_mla_decode` resolves to (where the layouts differ, dense -> paged).
+
+| Knob | Default | What it controls |
+| --- | --- | --- |
+| `block_N` / `chunk_d` | `64` / `128` (`block_N=32` if `kv_len < 64`) | score-tile height and output-column chunk of phase 1 |
+| `num_split` | `16`, clamped to divide the KV block count | KV partitions in phase 1 |
+| `vector_mode` | `None` -> dense `"simd"` at `block_N <= 64` / paged `"simd_rc"`; 128-token dense tile -> `"simd_rc"` | phase-1 elementwise programming model (`"simt"` for A/B) |
+| `merge_vector_mode` | `"simd"` (also `"simd_acc"`, `"simt"`) | merge accumulate + normalisation on the vector unit: merge 13.9 -> 9.1 us |
+| `partial_dtype` | `None` -> dense `"float16"`, paged `"float32"` | `O_partial` element type; halves the staging traffic on dense, measured slower on paged |
+| `ml_width` | `8` | row width of the `ML` staging tensor (one 32 B DMA granule) |
+| `stage_cols` | `None` -> `32` | column-slice width of the paged fp16 publish staging (experiment knob; paged ships fp32) |
+| `threads` / `num_stages` | `1024` / `2` | phase-1 AIV threads and pipeline depth |
+| `merge_rows` / `merge_stages` | `16` / `4` | merge block split and pipeline depth |
+
+`partial_dtype=None` and `vector_mode=None` are resolved inside `resolve_config`,
+per layout (and for `vector_mode`, per tile width), so a caller that passes only
+the shape gets the measured-best combination for that layout.
 
 ## Running
 
@@ -437,12 +530,16 @@ python -c "import sys; sys.path.insert(0, 'examples/ascend/mla_decode'); import 
 
 # pipeline attribution (one kernel per capture; output must not land on /)
 msprof op --warm-up=10 --launch-count=5 \
+    --aic-metrics=PipeUtilization,Memory,MemoryL0,L2Cache,ResourceConflictRatio \
     --output=/dev/shm/opp_dense python examples/ascend/mla_decode/bench/prof_phase1.py --which phase1
-msprof op --warm-up=10 --launch-count=5 --output=/dev/shm/opp_pg64 \
-    python examples/ascend/mla_decode/bench/prof_paged.py --block-size 64
 msprof op --warm-up=10 --launch-count=5 \
-    --output=/dev/shm/opp_merge python examples/ascend/mla_decode/bench/prof_merge.py
-python examples/ascend/mla_decode/bench/parse_pipes.py dense=/dev/shm/opp_dense paged_p64=/dev/shm/opp_pg64
+    --aic-metrics=PipeUtilization,Memory,MemoryL0,L2Cache,ResourceConflictRatio \
+    --output=/dev/shm/opp_pg64 python examples/ascend/mla_decode/bench/prof_paged.py --block-size 64
+msprof op --warm-up=10 --launch-count=5 \
+    --aic-metrics=PipeUtilization,Memory,MemoryL0,L2Cache,ResourceConflictRatio \
+    --output=/dev/shm/opp_merge python examples/ascend/mla_decode/bench/prof_merge.py --partial-dtype float16
+python examples/ascend/mla_decode/bench/parse_pipes.py \
+    dense=/dev/shm/opp_dense paged_p64=/dev/shm/opp_pg64 merge=/dev/shm/opp_merge
 ```
 
 On a shared machine, point the tilelang cache and temporary files off a
@@ -464,10 +561,10 @@ captures to `/dev/shm`; a full `/` fails compilation and capture alike.
   the first measurement point in a process is inflated under load (86.9 us vs
   78.8 us later in the same process). Head-to-head comparisons therefore stay
   inside one process, after the baseline has been warmed.
-- The round 1-4 history was collected on 2026-10-28 at load below 60; the
-  SimdVF/fp16-partial numbers on 2026-10-29 at load 90-120, and the final
-  `block_N=64` numbers at load 27-45 (dense) / 22.9 (paged). Spreads stay <= 0.3 us
-  and relative A/B comparisons stay inside one process.
+- Load history: round 1-4 on 2026-10-28 at load below 60; the SimdVF/fp16-partial
+  A/B on 2026-10-29 at load 90-120; the current numbers on 2026-10-30 at load
+  22-36. Spreads stay <= 0.3 us and relative A/B comparisons stay inside one
+  process.
 
 ## Known limitations
 
@@ -485,15 +582,24 @@ captures to `/dev/shm`; a full `/` fails compilation and capture alike.
 - **Paged multi-batch is covered:** batch 4/8 with shuffled page tables, per-batch
   variable length, page 64/128 x `block_N` 64/128, empty splits and `seq_len=1`.
   Not covered: page size 256, `max_pages > 8`, concurrent multi-stream use, and
-  page sizes 16/32/128 were not re-swept after the tiling change.
+  page sizes 16/32 were not re-swept (page 128 equals page 64 at 57.3 us).
 - **The tile sweep covers `dim` 256/512, `pe_dim` 128, `kv_len` up to 8193 and
   `num_stages` 1/2/3** (see `test_mla_decode_splitk_tiles.py` and
-  `test_mla_decode_coverage.py`), and the measured-best point was re-swept after
-  the `block_N=64` retune (`chunk_d` 64/128, `num_split` 8/16/32, `num_stages`
-  1-4); it is still not a full Cartesian product.
-- **`partial_dtype="float16"` halves the merge's read traffic but measured no
-  gain** (the merge is latency bound: `AIV vec` 91% against `mte2` 69.9%), so
-  `"float32"` is the default.
+  `test_mla_decode_coverage.py`); the measured-best point was re-swept after the
+  `block_N=64` retune (`chunk_d` 64/128, `num_split` 8/16/32, `num_stages` 1-4)
+  and the merge knobs were swept too (`rows_per_block` 8/16/32, `num_stages`
+  2/4/8, `threads` 128/256/512). It is still not a full Cartesian product.
+- **`partial_dtype="float16"` is the dense default but stays fp32 on paged.** With
+  the merge's fp16 widening path it drops the merge to 9.1 us and the dense
+  end-to-end to 46.4 us; on paged the same change measured slower (57.0 us fp32 ->
+  59.4 us with 32-column staging -> 68.7 us full-width), so paged ships
+  `"float32"`.
+- **The KV cache is read twice per phase-1 tile** (once as K for QK, once
+  transposed as V for PV, 1232 KB/block). The UB-staging fix does not exist in this
+  release: `T.copy(ub->l1, transpose=True)` compiles but silently ignores the
+  transpose (wrong results, rel 1.285), a raw UB->L1 copy does not produce the NZ
+  layout a GEMM needs, and an L1->L1 transpose fails device compilation (no
+  DMAPath).
 - **No causal mask, dropout, attention bias, padding mask, or `q_len > 1`.**
 - **Non-contiguous inputs are rejected** by the runtime packed-ABI stride check
   (`strides[2] violates packed ABI constraint`); call `.contiguous()` first - it
@@ -501,9 +607,9 @@ captures to `/dev/shm`; a full `/` fails compilation and capture alike.
   calls are bitwise identical (100-call soak), but multi-process, multi-stream and
   hour-long soak runs are untested.
 - Accuracy: `rel <= 6.2e-4` across the dense matrix and `<= 5.4e-4` for paged
-  (`rtol=atol=1e-2`); with the SIMD vector modes the reference shape measures
-  3.4e-4, so splitting, merging and the SIMD passes add no measurable error over
-  the `num_split=1` kernel.
+  (`rtol=atol=1e-2`); with the SIMD passes and fp16 partials the reference shape
+  measures 3.8e-4, so splitting, merging and the SIMD passes add no measurable
+  error over the `num_split=1` kernel.
 
 ---
 

@@ -8,11 +8,11 @@ needed beyond the Ascend runtime (see the [parent README](../README.md)).
 | --- | --- | --- |
 | [bench_default.py](bench_default.py) | Baseline `num_split=1` kernel vs the shipped dense defaults; checks correctness of the optimized path first | `DEFAULTRUN rel=... baseline_us=... e2e_us=... speedup=... tflops=...` |
 | [bench_paged.py](bench_paged.py) | Paged kernel over page size, tile width and split count, including the previous `block_N=128` default as an A/B; the dense default kernel is measured first in the same process as the reference | `PGDENSE dense_optimized_us=...` then one `PG <case> ... e2e_us=... rel=... paged_over_dense=...` line per case |
-| [bench_partial_dtype.py](bench_partial_dtype.py) | A/B of the merge input dtype: compiles phase 1 + merge for fp32 and fp16 `O_partial` in one process, checks both against the reference (plus two softmax-distribution stresses) and times merge-only, phase 1 and end-to-end interleaved. **Measured conclusion: no gain** - the merge is latency bound, so fp32 stays the default | `REL ...`, then `TIME` / `AB` / `DECOMP` / `E2E_TFLOPS` / `VERDICT` lines |
+| [bench_partial_dtype.py](bench_partial_dtype.py) | A/B of the merge input dtype: compiles phase 1 + merge for fp32 and fp16 `O_partial` in one process, checks both against the reference (plus two softmax-distribution stresses) and times merge-only, phase 1 and end-to-end interleaved. The shipped defaults differ per layout (dense fp16, paged fp32 - see the parent README), so this is the tool to re-check the choice on a new shape | `REL ...`, then `TIME` / `AB` / `DECOMP` / `E2E_TFLOPS` / `VERDICT` lines |
 | [prof_phase1.py](prof_phase1.py) | msprof entry that builds **only** the dense phase-1 kernel (or the full call with `--which e2e`) | prints the partial-output magnitude |
 | [prof_paged.py](prof_paged.py) | msprof entry that builds only the paged phase-1 kernel (`--block-size`, `--block-n`, `--num-split`) | prints the partial-output magnitude |
-| [prof_merge.py](prof_merge.py) | msprof entry that builds only the merge kernel (`--num-split`, `--ml-width`) | prints the output magnitude |
-| [parse_pipes.py](parse_pipes.py) | Summarises a capture's 8 CSVs: per-pipe busy time and share, wait ratios, achieved TFLOPS and GB/s | one block per capture |
+| [prof_merge.py](prof_merge.py) | msprof entry that builds only the merge kernel (`--num-split`, `--ml-width`, `--partial-dtype` default `float16`) | prints the output magnitude |
+| [parse_pipes.py](parse_pipes.py) | Summarises a capture's CSVs: per-pipe busy time and share, wait ratios, the L2 read hit rate, GM->L1 / GM->UB traffic and bandwidth usage, L0 bandwidth, the MTE instruction counts, group-busy totals, and the achieved TFLOPS / GB/s | one block per capture |
 
 `bench_default.py` reports the baseline above the optimized path on purpose: the
 first measurement point in a process is inflated by the warm-up, so the ratio is
@@ -26,15 +26,15 @@ Field meanings: `e2e_us` is one call (phase 1 + merge) in microseconds,
 paged is faster).
 
 `bench_partial_dtype.py` compiles four kernels (a phase-1/merge pair per dtype), so
-it is the slowest entry; its conclusion is already recorded in the parent README's
-known limitations, and it prints a `VERDICT` line combining its acceptance checks
-with the load/spread trust flag.
+it is the slowest entry. The shipped choice per layout is recorded in the parent
+README, and the script prints a `VERDICT` line combining its acceptance checks with
+the load/spread trust flag, so it can re-validate that choice on a new shape.
 
 ## Timing methodology
 
 Latency comes from `do_bench(backend="event", _n_warmup=10, _n_repeat=50)`,
-three rounds per configuration, median reported. Data is only used when the
-spread across rounds is at most 0.3 us; the reported numbers have 0.02-0.11 us.
+3-5 rounds per configuration, median reported. Data is only used when the spread
+across rounds is at most 0.3 us; the reported numbers have 0.02-0.3 us.
 The machine is shared - if the spread grows or the first round is far above the
 others, the load is too high and the numbers should be re-taken later.
 
@@ -48,14 +48,23 @@ helper attributes only one of them (which once inflated an end-to-end speedup by
 
 ```bash
 msprof op --warm-up=10 --launch-count=5 \
+    --aic-metrics=PipeUtilization,Memory,MemoryL0,L2Cache,ResourceConflictRatio \
     --output=/dev/shm/opp_dense python .../bench/prof_phase1.py --which phase1
 msprof op --warm-up=10 --launch-count=5 \
+    --aic-metrics=PipeUtilization,Memory,MemoryL0,L2Cache,ResourceConflictRatio \
     --output=/dev/shm/opp_pg64 python .../bench/prof_paged.py --block-size 64
 msprof op --warm-up=10 --launch-count=5 \
-    --output=/dev/shm/opp_merge python .../bench/prof_merge.py
-python .../bench/parse_pipes.py dense=/dev/shm/opp_dense paged_p64=/dev/shm/opp_pg64
+    --aic-metrics=PipeUtilization,Memory,MemoryL0,L2Cache,ResourceConflictRatio \
+    --output=/dev/shm/opp_merge python .../bench/prof_merge.py --partial-dtype float16
+python .../bench/parse_pipes.py \
+    dense=/dev/shm/opp_dense paged_p64=/dev/shm/opp_pg64 merge=/dev/shm/opp_merge
 ```
 
+- **Pass all five `--aic-metrics` groups.** `parse_pipes.py` reads
+  `PipeUtilization`, `Memory`, `MemoryL0`, `L2Cache` and `ResourceConflictRatio`
+  (duration and frequency come from `OpBasicInfo`); omitting one silently drops
+  the corresponding lines (L2 hit rate, traffic, L0 bandwidth, MTE instruction
+  counts).
 - **Write the capture to `/dev/shm`** (or a data partition). A full root
   partition fails the capture, and it also fails the kernel compilation because
   the tilelang cache lives under the home directory by default. On a shared
@@ -73,7 +82,9 @@ python .../bench/parse_pipes.py dense=/dev/shm/opp_dense paged_p64=/dev/shm/opp_
 
 `parse_pipes.py` prints, per capture: task duration, block dim and frequency; AIC
 busy time and share for cube / mte1 / mte2 / fixpipe / scalar; AIV busy time and
-share for vec / mte2 / mte3; the dominant wait ratios; and the achieved compute
-and aggregate bandwidth as a share of the platform peak. AIC and AIV are separate
-cores running concurrently, so the two groups do not add up to 100%, and pipes
-within a group can overlap.
+share for vec / mte2 / mte3; the dominant wait ratios; the L2 read hit rate
+(close/far split); GM->L1 and GM->UB traffic with the per-block bandwidth and pipe
+busy share; L0 read/write bandwidth; the MTE2/MTE1 instruction counts; the group
+busy totals; and the achieved compute and aggregate bandwidth as a share of the
+platform peak. AIC and AIV are separate cores running concurrently, so the two
+groups do not add up to 100%, and pipes within a group can overlap.

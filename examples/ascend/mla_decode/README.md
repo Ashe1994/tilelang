@@ -34,7 +34,9 @@ test_mla_decode_api.py           # dispatch/defaulting policy, no device require
 bench/bench_default.py           # dense baseline vs shipped defaults (correctness + latency)
 bench/bench_paged.py             # paged page sizes vs dense, with a correctness guard
 bench/bench_partial_dtype.py     # A/B of O_partial fp32 vs fp16 (dense ships fp16, paged fp32)
+bench/bench_sweep.py             # tiered KV-cache sweep: latency, TFLOPS, bandwidth utilisation
 bench/prof_*.py, bench/parse_pipes.py  # single-kernel msprof captures + CSV summary; see bench/README.md
+VERIFICATION.md                  # self-verification report (environment, tests, perf, profile, negatives)
 ```
 
 The suite is 101 cases: 5 baseline, 7 dense split-KV regression, 39 dense shape
@@ -44,6 +46,13 @@ long tail, extra tile combinations, call hygiene and a 100-call soak) and 6
 unified-API dispatch/equivalence cases. Everything validates against an fp32 torch
 reference with `rtol=atol=1e-2`, and every case is repeatable bitwise across
 calls.
+
+## Verification
+
+[`VERIFICATION.md`](VERIFICATION.md) is the self-verification report for this
+tree: the exact environment, the 101/101 correctness run, the end-to-end and
+per-tier latencies with bandwidth utilisation, the msprof profile of all three
+kernels, and the optimisation directions that were measured and closed.
 
 ## Unified entry point
 

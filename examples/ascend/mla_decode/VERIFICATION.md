@@ -15,7 +15,7 @@ same session; this report covers the final state.
 | CANN | 9.3.0 (toolkit + 950 ops) |
 | tilelang | `0.1.15+cpu.git876a59e6` |
 | PyTorch | `2.10.0+cpu` + `torch_npu 2.10.0`, Python 3.11.16 |
-| host load | correctness 37-60; latency runs 37-132 (shared host, see section 8) |
+| host load | correctness 37-60; latency runs 37-132 (shared host, see section 9) |
 
 Reference shape: `batch=1, heads=128, kv_len=8192, dim=512, pe_dim=64`.
 
@@ -52,7 +52,62 @@ meaningful.
 The two-tile CV-overlap schedule is worth -7.6% end-to-end against the
 single-tile schedule (56.9 -> 52.6 us; phase 1 47.7 -> 43.6 us, -8.6%).
 
-## 4. Two-tile CV-overlap schedule (phase 1)
+## 4. Multi-batch scaling (native vs paged vs persistent)
+
+`bench/bench_persistent.py`, event timing, 3 rounds, median, host load 21-46.
+`mla_decode_persistent.py` runs the same two-tile phase 1 but walks the
+(batch, head tile, split) space with `T.Persistent` on one block per core.
+
+| case | native | paged | persistent | persistent / paged |
+|---|---:|---:|---:|---:|
+| B=1, [8192] | 1549.5 us | 53.8 us | 53.7 us | 1.00x |
+| B=2, [8192]*2 | 1556.1 us | 102.6 us | 99.6 us | 1.03x |
+| B=4, [8192]*4 | 1556.6 us | 156.0 us | 185.8 us | 0.84x |
+| B=8, [8192]*8 | 1557.8 us | 260.2 us | 359.5 us | 0.72x |
+| B=2, [8192, 1024] | n/a (dense needs one length) | 100.4 us | **74.5 us** | **1.35x** |
+| B=4, [8192, 2048, 512, 4096] | n/a | 106.9 us | 119.6 us | 0.89x |
+
+`msprof op --warm-up=10 --launch-count=5 --aic-metrics=PipeUtilization,Memory,
+MemoryL0,ResourceConflictRatio,L2Cache` on one launch per variant:
+
+| kernel (case) | grid | duration | TFLOPS | %cube peak | GB/s | %GM peak | AIC busy | AIV busy |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| native B=4 | 4 | 1556.5 us | 1.5 | 0.3% | 46 | 1.2% | 45.3% | 90.7% |
+| paged B=4 | 64 | 128.8 us | 17.7 | 4.1% | 627 | 15.7% | 32.2% | 24.5% |
+| persistent B=4 | 16 | 161.3 us | 14.1 | 3.3% | 501 | 12.5% | 100.3% | 77.1% |
+| paged ragged B=2 | 32 | 85.9 us | 26.6 | 6.1% | 470 | 11.7% | 49.3% | 37.6% |
+| persistent ragged B=2 | 16 | 57.5 us | 39.7 | 9.2% | 470 | 11.7% | 91.5% | 77.4% |
+
+What the numbers say:
+
+* the **native** kernel launches `batch` blocks (Block Dim 4 for batch=4) and its
+  AIV is busy 90% of the duration, so it leaves 12 of the 16 cores idle and is
+  vector bound -- 1.5 TFLOPS and 46 GB/s at any batch size;
+* the **paged** grid (`batch * splits` blocks) turns that into free cube/vector
+  overlap: a core starts the next block's cube while the previous block's vector
+  tail drains, so B=4 phase 1 is 128.8 us instead of 4 x 43.6 us;
+* the **persistent** grid is one block per core, so its items serialise (no
+  cross-block overlap): B=4/B=8 phase 1 loses 25-30% against the paged grid, and
+  `num_stages>1` on `T.Persistent` is not usable because the scheduler versions
+  the phase-1 buffers and the dynamic UBUF grows to 339 KB (limit 221184 B);
+* for a **ragged** batch the persistent assignment (one split of every batch per
+  core) is a straight win: batch=2 [8192, 1024] goes 100.4 -> 74.5 us because the
+  paged grid otherwise waits for the sequence that owns 8 tiles per split while
+  the short one owns one. With four unequal sequences the per-item serialisation
+  eats the balance again (0.89x), so the win is batch-size dependent.
+
+Supported envelope of the prototype: `block_N=64`, one page per tile,
+`chunk_d=128`, fp32 partials (the wider geometries and the fp16 publish staging
+exceed the UB budget and are rejected with an explicit assertion; use
+`compile_mla_decode_paged` for them).
+
+The obvious follow-up is a **packed, length-proportional split plan** on the
+paged grid: keep the `batch * splits` blocks (and therefore the cross-block
+overlap) but choose each block's tile range from a global plan so every block
+owns the same number of KV tiles. That should keep the uniform-batch numbers and
+recover the ragged-batch win without the persistent item serialisation.
+
+## 5. Two-tile CV-overlap schedule (phase 1)
 
 Design: two KV tiles are kept in flight. K/K_pe of both tiles are prefetched into
 double-buffered L1 tiles, both QK GEMMs are issued (two L0C score tiles), and only
@@ -75,7 +130,7 @@ pools beyond its default partition. The physical budgets still hold: L1 ~400 KiB
 of 512 KiB, dynamic UBUF about the same as the single-tile kernel (the launch
 succeeds).
 
-## 5. Profile - paged phase 1, 43.6 us (two-tile schedule)
+## 6. Profile - paged phase 1, 43.6 us (two-tile schedule)
 
 `msprof op --warm-up=10 --launch-count=5 --aic-metrics=PipeUtilization,Memory,
 MemoryL0,ResourceConflictRatio,L2Cache`, one kernel per capture, summarised by
@@ -105,7 +160,7 @@ overlap ceiling is `max(cube 10.55, mte2 13.22, vec 29.05) = 29.1 us`, so about
 half of the dependency chain stall is gone; the PV phase and the second softmax
 still serialise.
 
-## 6. Bandwidth utilisation over data volume (two-tile schedule)
+## 7. Bandwidth utilisation over data volume (two-tile schedule)
 
 Page 64, batch 1, 3 rounds; "moved" is the KV read (K + V^T + k_pe) plus the
 fp32 partials write/read:
@@ -121,7 +176,7 @@ Utilisation rises with data volume because the fixed per-launch cost dominates
 the small tiers; from ~8 MiB upward the kernel is linear in the data volume and
 no tier is bandwidth limited.
 
-## 7. Measured dead ends
+## 8. Measured dead ends
 
 | direction | measurement | verdict |
 |---|---|---|
@@ -176,7 +231,7 @@ Verdict: the hand-written mixed kernel needs a dedicated compiler-side effort
 2-AIV flag counting) rather than a session prototype. The shipped two-tile
 auto-scheduled schedule remains the best verified kernel.
 
-## 8. Trust conditions on a shared host
+## 9. Trust conditions on a shared host
 
 The host is shared with other users' benchmarking jobs; load moved between 37 and
 900 during this session. Correctness is load-independent (only slower), and the
@@ -185,7 +240,7 @@ latency table above was taken at load 37-132 with the median of three rounds;
 within 5%. Runs taken at higher load are visible in the raw logs and were not
 used for the numbers above.
 
-## 9. Reproduction
+## 10. Reproduction
 
 ```bash
 export TILELANG_DEFAULT_TARGET=ascend
@@ -202,22 +257,27 @@ python bench/parse_pipes.py paged=/dev/shm/prof/paged
 (it prints `dual_schedule=True/False`), so the capture always profiles the kernel
 the benchmark would run.
 
-## 10. Open items
+## 11. Open items
 
 1. **Cube/Vector overlap, part 2** - the two-tile schedule overlaps QK with the
    other tile's softmax. Pushing further is *not* reachable by rearranging this
    kernel: three slots, V^T double buffering, PV/softmax reordering and a deeper
-   pair loop all measured slower or neutral (section 7), so the batched-phase
+   pair loop all measured slower or neutral (section 8), so the batched-phase
    two-tile schedule is a local optimum for this auto-scheduler. The next step
    would be a hand-written `T.MixedKernel` with explicit `T.Cube()` /
    `T.Vector()` regions and manual flags, or compiler support for cross-iteration
    multi-buffering.
-2. **paged full-SIMD vector modes** (`simd` / `simd_exp`) are not implemented in
+2. **packed length-proportional split plan** - keep the paged grid (and its
+   cross-block overlap) but balance the KV tiles per block from a global plan;
+   this is the follow-up to the persistent probe (section 4), where balance won
+   1.35x on a ragged batch but the one-block-per-core grid lost 0.72-0.89x on
+   uniform multi-batch work.
+3. **paged full-SIMD vector modes** (`simd` / `simd_exp`) are not implemented in
    this kernel; the earlier fp32-partial build measured `simd_exp` at +56%.
 3. **KV single read** remains blocked by the NT-only L1 GEMM and the layout
-   inference conflict (see section 7).
+   inference conflict (see section 8).
 
-## 11. History
+## 12. History
 
 The directory was slimmed to the native reference + the paged kernel (with its
 tests, two benchmark entries, the profile summariser, this report and the

@@ -14,6 +14,11 @@ Two kernels live here:
   addressed through `block_table` + `cache_seqlens`, the KV blocks are split
   across cores, and a second kernel merges the per-split partials. Phase 1 and
   the merge kernel live in this one module.
+* `mla_decode_persistent.py` - the same phase 1 underneath `T.Persistent`: a
+  fixed grid of one block per AI core walks the (batch, head tile, split) item
+  space, which balances a ragged batch and (measured) beats the paged kernel by
+  35% there, at the cost of the cross-block overlap the paged grid gets for free
+  on uniform multi-batch work.
 
 Measured on the reference shape (batch=1, heads=128, kv_len=8192, dim=512,
 pe_dim=64): native 1549.4 us, paged page 64 **52.6 us** = **29.5x**,
@@ -26,8 +31,11 @@ example_mla_decode.py        # native decode: num_split=1, one launch per call
 example_mla_decode_paged.py  # paged decode: split-KV phase 1 + the merge kernel
 test_mla_decode.py           # native kernel: 5 shapes against the fp32 reference
 test_mla_decode_paged.py     # paged: 21 cases (page geometry, shuffled tables, ragged lengths, empty splits, multi-batch)
+mla_decode_persistent.py     # persistent phase 1 (T.Persistent, one block per core) + the shared merge
 bench/bench_paged.py         # paged latency + correctness guard, compared with the native kernel
+bench/bench_persistent.py    # multi-batch / ragged batch: native vs paged vs persistent
 bench/prof_paged.py          # single-kernel msprof entry for the paged phase 1
+bench/prof_multi.py          # msprof entry for one kernel of native / paged / persistent
 bench/parse_pipes.py         # summarise msprof captures (pipes, waits, L2, bandwidth, MTE counts)
 VERIFICATION.md              # self-verification report
 ```
@@ -120,6 +128,46 @@ Page 128 and page 64 are equally fast; `block_N=128` falls back to the
 single-tile schedule and is slower; extra splits are slower. The two-tile
 schedule is worth **-7.6% end-to-end / -8.6% phase 1** against the single-tile
 schedule on the reference shape.
+
+## Multi-batch and ragged batches
+
+`bench/bench_persistent.py` sweeps the three kernels over uniform and ragged
+batches (`do_bench` event timing, 3 rounds, median; the dense native kernel needs
+a uniform length, so it runs on the uniform rows only):
+
+| case | native | paged | persistent | persistent vs paged |
+|---|---:|---:|---:|---:|
+| B=1, [8192] | 1549.5 us | 53.8 us | 53.7 us | 1.00x |
+| B=2, [8192]*2 | 1556.1 us | 102.6 us | 99.6 us | 1.03x |
+| B=4, [8192]*4 | 1556.6 us | 156.0 us | 185.8 us | 0.84x |
+| B=8, [8192]*8 | 1557.8 us | 260.2 us | 359.5 us | 0.72x |
+| B=2, [8192, 1024] | n/a | 100.4 us | **74.5 us** | **1.35x** |
+| B=4, [8192, 2048, 512, 4096] | n/a | 106.9 us | 119.6 us | 0.89x |
+
+Why the split result: the paged grid is `batch * splits` blocks, so at batch>=2
+two blocks share a core's AIC and AIV ports and the next block's cube starts
+while the previous block's vector tail drains -- free cross-block overlap. The
+persistent grid is one block per core, so its items serialise (no overlap) but
+the work per core is exactly one split of every batch, which is why a ragged
+batch is balanced instead of waiting for its longest sequence.
+
+`msprof op` utilisation on the same runs (`bench/prof_multi.py`, parsed by
+`bench/parse_pipes.py`; % of the 432 TFLOPS / 4 TB/s peaks):
+
+| kernel (case) | grid | duration | TFLOPS | %cube | GB/s | %GM |
+|---|---:|---:|---:|---:|---:|---:|
+| native B=4 | 4 | 1556.5 us | 1.5 | 0.3% | 46 | 1.2% |
+| paged B=4 | 64 | 128.8 us | 17.7 | 4.1% | 627 | 15.7% |
+| persistent B=4 | 16 | 161.3 us | 14.1 | 3.3% | 501 | 12.5% |
+| paged ragged B=2 | 32 | 85.9 us | 26.6 | 6.1% | 470 | 11.7% |
+| persistent ragged B=2 | 16 | 57.5 us | 39.7 | 9.2% | 470 | 11.7% |
+
+The native kernel launches `batch` blocks (Block Dim 4 at batch=4), so it leaves
+12 of the 16 cores idle and is vector-bound (AIV 90% of the duration): that is
+where its 1.5 TFLOPS comes from. Use `compile_mla_decode_paged` for uniform
+multi-batch serving and `compile_mla_decode_persistent` when the batch is ragged
+(the persistent prototype supports the shipped page geometry at fp32 partials
+only; other shapes fall back to the paged kernel).
 
 ## Profile (msprof)
 

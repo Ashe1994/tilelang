@@ -146,6 +146,36 @@ no tier is bandwidth limited.
 | reorder: slot-0 PV placed between the two softmax passes | e2e 56.8 vs 53.6 us (same run); the scheduler prefers the batched phases | closed |
 | two-tile pair loop `num_stages` 2 / 3 | 53.65 / 53.85 us vs 53.60 us e2e | closed |
 
+### Manual mixed-kernel probe (exploratory, 2026-11-02)
+
+Tried the hand-written `T.Cube()` / `T.Vector()` path (auto-scheduling off) as
+the next step for CV overlap. What the probe established:
+
+* manual mode is entered with
+  `pass_configs={PassConfigKey.TL_ENABLE_AUTO_SCHEDULE: False}` **and** a
+  `tvm.target.Target("ascend")` context, otherwise layout inference raises
+  `Target context required`;
+* `T.MixedKernel` is rejected in manual mode: software `dual_copy` must sit in an
+  explicit `T.Vector()` block, so the kernel has to be `T.Kernel` + explicit
+  `Cube()` / `Vector()` regions (the sub-block id comes from `T.Vector()`);
+* write-time semantic checks: `T.Parallel` must be inside a VF block, DMA copies
+  cannot cast dtypes, `dual_copy` needs an exact 2:1 split ratio;
+* cross-core and intra-core flags do lower (`asc_sync_inter_arrive/wait`,
+  `asc_sync_notify/wait`, `asc_threadfence`), but `T.ascend_pipe_barrier` is
+  silently dropped and **no `InsertSync` runs in manual mode**, so every
+  MTE2->MTE1, MAD->FIX and V->MTE3 ordering is the user's responsibility;
+* a one-tile manual kernel (QK + softmax + PV + publish) compiles and launches
+  (`__mix__(1, 2)`, fixpipe `dual_copy`, `asc_copy_ub2l1`, VF calls all present)
+  but computes garbage (rel ~1 or nan), and an isolated `p @ W` probe fails as
+  well: the generated `asc_copy_ub2l1` destination uses a `sid * 1024` byte
+  offset for a per-AIV L1 tile that is 8 KiB, i.e. the manual per-AIV L1
+  addressing convention is undocumented in this build.
+
+Verdict: the hand-written mixed kernel needs a dedicated compiler-side effort
+(documented per-AIV L1 offsets, an emitting barrier API, sync protocol for the
+2-AIV flag counting) rather than a session prototype. The shipped two-tile
+auto-scheduled schedule remains the best verified kernel.
+
 ## 8. Trust conditions on a shared host
 
 The host is shared with other users' benchmarking jobs; load moved between 37 and

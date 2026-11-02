@@ -33,14 +33,58 @@ the port:
     which the merge weights to exactly 0.
 
 Everything else -- split-KV, the phase-1/merge pair, fused QK accumulate, fused
-rescale, ``pick_tiling`` -- is shared with ``example_mla_decode_splitk``; the
-merge kernel is imported rather than copied.
+rescale, ``pick_tiling`` -- keeps the same design as the native decode kernel in
+``example_mla_decode.py``; the merge kernel lives in this module so the paged
+delivery is self-contained.
 """
 
 import tilelang
 import tilelang.ascend.language as T
 
-from example_mla_decode_splitk import mla_decode_merge, pick_tiling
+# Row width of the ``ML`` staging tensor used by the merge kernel (column 0 holds
+# ``m + log(l)``; the rest is padding to one 32 B DMA granule).
+ML_WIDTH = 8
+
+
+def pick_tiling(kv_len, dim, block_N=None, chunk_d=None, merge_chunk_d=None):
+    """Pick the measured-best tiling for a shape.
+
+    Defaults are the measured optimum after the SimdVF pass landed:
+    ``block_N=64, chunk_d=128``. Historically ``block_N=128`` was faster (fewer
+    rescale sweeps per KV element), but with the SimdVF rescale the 64-token tile
+    wins: it halves the score buffers, which frees UB for cross-stage overlap and
+    is the only tiling where the full-SIMD vector_mode fits at ``kv_len=8192``.
+    The merge tiles columns independently, so it keeps 128-wide DMAs.
+    """
+    if block_N is None:
+        # Measured after the SimdVF pass landed: a 64-token score tile beats 128
+        # on the reference shape (70.8 -> 54.2 us e2e; the merge/fp16 work that
+        # builds on it reaches 46.4 us). The smaller tile halves
+        # the score buffers, which both frees UB for the scheduler to overlap
+        # more stages and is the only tiling where the full-SIMD `vector_mode`
+        # fits at kv_len=8192 (block_N=128 needs 222208 B > the 221184 B limit).
+        block_N = 64 if kv_len >= 64 else 32
+    if chunk_d is None:
+        # Keep few, wide PV chunks: at block_N=64 this is 4 chunks per tile and
+        # measured ~16% faster than chunk_d=64 (8 chunks). The 128-token tile
+        # keeps 64 so its score/output staging stays inside L0C and UB.
+        chunk_d = 64 if block_N >= 128 else 128
+    if merge_chunk_d is None:
+        merge_chunk_d = 128 if dim % 128 == 0 else chunk_d
+    assert dim % chunk_d == 0, "dim must be a multiple of chunk_d"
+    assert dim % merge_chunk_d == 0, "dim must be a multiple of merge_chunk_d"
+    return block_N, chunk_d, merge_chunk_d
+
+
+def effective_split(kv_len, block_N, num_split):
+    """Split count actually used: bounded by the KV block count, must divide it."""
+    kv_blocks = (kv_len + block_N - 1) // block_N
+    ns = min(num_split, kv_blocks)
+    while kv_blocks % ns != 0:
+        ns -= 1
+    return ns
+
+
 
 # The paged kernel carries one score tile per page chunk, so it trims the ML row
 # from 32 to 8 floats (still one 32 B DMA granule) to stay inside the UB budget.
@@ -76,8 +120,8 @@ def mla_decode_paged_fwd(
     and needs the 6 KiB that the dense kernel spends on a 32-wide row.
 
     ``partial_dtype`` is the dtype of the published ``O_partial`` ("float32" or
-    "float16", same meaning as in ``example_mla_decode_splitk``). The merge kernel
-    imported from there must be compiled with the same value.
+    "float16"). The merge kernel defined in this module must be compiled with the
+    same value.
 
     ``vector_mode`` selects the programming model of the PV rescale/accumulate
     pass, the largest elementwise pass of a tile: ``"simd_rc"`` (default) runs
@@ -365,6 +409,247 @@ def mla_decode_paged_fwd(
     return main
 
 
+def mla_decode_merge(
+    batch,
+    heads,
+    kv_len,
+    dim,
+    pe_dim,
+    block_H=128,
+    block_N=64,
+    chunk_d=128,
+    num_split=8,
+    threads=256,
+    rows_per_block=16,
+    num_stages=4,
+    ns_explicit=None,
+    ml_width=ML_WIDTH,
+    partial_dtype="float16",
+    merge_vector_mode="simd",
+):
+    """Phase 2: combine the per-split partials into the final fp16 output.
+
+    ``rows_per_block`` splits the 128-row head block across more blocks. With the
+    default (one block per column chunk) the merge runs on ``heads/block_H *
+    dim/chunk_d`` blocks only -- 4 for the MLA decode shape -- so the split loop
+    was latency bound rather than bandwidth bound.
+
+    ``num_stages`` pipelines that split loop, overlapping the next split's DMA
+    with the current split's vector accumulate.
+
+    ``merge_vector_mode`` selects how the per-split elementwise passes
+    (``acc += tmp * wts[i, r]`` and the final ``out_h = acc / row_sum``) run:
+
+      "simt"     -- ``T.SimtVF``, one scalar op per lane (the original kernel)
+      "simd"     -- both passes in ``T.SimdVF`` (64 fp32 lanes per instruction)
+      "simd_acc" -- only the accumulate pass in ``T.SimdVF``; the fp16 output
+                    normalisation stays in ``T.SimtVF``
+
+    The SimdVF passes need whole 64-lane vector registers along the column axis
+    (``chunk_d % 64 == 0``); anything else falls back to SimtVF automatically.
+    """
+    dtype = "float16"
+    accum_dtype = "float32"
+    assert partial_dtype in (accum_dtype, dtype), (
+        'partial_dtype must be "float32" or "float16"'
+    )
+    assert merge_vector_mode in ("simt", "simd", "simd_acc"), (
+        'merge_vector_mode must be "simt", "simd" or "simd_acc"'
+    )
+    # SimdVF whole-register condition: 64 fp32 lanes along the tiled c axis.
+    simd_merge = merge_vector_mode in ("simd", "simd_acc") and chunk_d % 64 == 0
+    # A float16 O_partial needs an explicit fp16->fp32 widening: the generic
+    # SimdVF lowering rejects the implicit `T.Cast("float32", tmp[...])`. The
+    # intrinsic path below widens with vcvt and keeps the accumulator in the
+    # de-interleaved lane layout vcvt produces (even lanes in the low half,
+    # odd lanes in the high half of each 128-column group); the final
+    # normalisation pass writes it back contiguously.
+    simd_widen = (
+        simd_merge and partial_dtype != accum_dtype and chunk_d % 128 == 0
+    )
+    if partial_dtype != accum_dtype and simd_merge and not simd_widen:
+        simd_merge = False  # cannot widen generically: stay on the scalar path
+    simd_norm = merge_vector_mode == "simd" and chunk_d % 64 == 0 and not simd_widen
+
+    RP = block_H if rows_per_block is None else rows_per_block
+    assert block_H % RP == 0, "block_H must be a multiple of rows_per_block"
+    RSPLIT = block_H // RP
+    NUM_M_TILES = heads // block_H
+    NUM_DC = dim // chunk_d
+    # ns_explicit bypasses the kv_len-derived split count: the paged kernel has a
+    # runtime sequence length, so its split count is fixed by the caller instead.
+    NS = effective_split(kv_len, block_N, num_split) if ns_explicit is None else ns_explicit
+    NUM_BLOCKS = batch * NUM_M_TILES * NUM_DC * RSPLIT
+
+    @T.prim_func
+    def merge_main(
+        O_partial: T.Tensor((NS, batch, heads, dim), partial_dtype),
+        ML: T.Tensor((NS, batch, heads, ml_width), accum_dtype),
+        O: T.Tensor((batch, heads, dim), dtype),
+    ):
+        with T.Kernel(NUM_BLOCKS) as bx:
+            b = bx // (NUM_M_TILES * NUM_DC * RSPLIT)
+            rem = bx % (NUM_M_TILES * NUM_DC * RSPLIT)
+            h0 = (rem // (NUM_DC * RSPLIT)) * block_H + (rem % RSPLIT) * RP
+            dc = (rem // RSPLIT) % NUM_DC
+
+            acc = T.alloc_shared((RP, chunk_d), accum_dtype)
+            # The streamed partial tile keeps the element type it has in GM, so an
+            # fp16 O_partial moves half the bytes; the widening happens in the
+            # accumulate below, not in an extra staging buffer.
+            tmp = T.alloc_shared((RP, chunk_d), partial_dtype)
+            out_h = T.alloc_shared((RP, chunk_d), dtype)
+            ml = T.alloc_shared((RP, ml_width), accum_dtype)
+            # The split axis is a TIR loop, not a Python unroll: unrolling one
+            # copy+sync group per split pushes the scheduler past the dav-3510
+            # intra-core flag pool ("total spilled mutex slots (46) exceed 32")
+            # once num_split reaches 16.
+            lse = T.alloc_shared((NS, RP), accum_dtype)
+            wts = T.alloc_shared((NS, RP), accum_dtype)
+            row_max = T.alloc_shared((RP,), accum_dtype)
+            row_sum = T.alloc_shared((RP,), accum_dtype)
+
+            # gather the per-split log-sum-exp and track the running maximum
+            with T.SimtVF(threads=threads):
+                for r in T.Parallel(RP):
+                    row_max[r] = -T.infinity(accum_dtype)
+            if num_stages > 1:
+                for i in T.Pipelined(NS, num_stages=num_stages):
+                    T.copy(ML[i, b, h0:h0 + RP, 0:ml_width], ml)
+                    with T.SimtVF(threads=threads):
+                        for r in T.Parallel(RP):
+                            lse[i, r] = ml[r, 0]
+                            row_max[r] = T.max(row_max[r], ml[r, 0])
+            else:
+                for i in T.serial(NS):
+                    T.copy(ML[i, b, h0:h0 + RP, 0:ml_width], ml)
+                    with T.SimtVF(threads=threads):
+                        for r in T.Parallel(RP):
+                            lse[i, r] = ml[r, 0]
+                            row_max[r] = T.max(row_max[r], ml[r, 0])
+
+            with T.SimtVF(threads=threads):
+                for r in T.Parallel(RP):
+                    row_sum[r] = 0.0
+                for i in T.serial(NS):
+                    for r in T.Parallel(RP):
+                        wts[i, r] = T.exp(lse[i, r] - row_max[r])
+                        row_sum[r] = row_sum[r] + wts[i, r]
+
+                for r, c in T.Parallel(RP, chunk_d):
+                    acc[r, c] = 0.0
+
+            if num_stages > 1:
+                for i in T.Pipelined(NS, num_stages=num_stages):
+                    T.copy(
+                        O_partial[i, b, h0:h0 + RP, dc * chunk_d:(dc + 1) * chunk_d],
+                        tmp,
+                    )
+                    if simd_widen:
+                        # fp16 partial on the vector unit: widen with vcvt and
+                        # accumulate in the de-interleaved lane layout that
+                        # vcvt produces (even columns in the low 64 lanes of a
+                        # 128-column group, odd columns in the high 64).
+                        with T.SimdVF():
+                            mask32 = T.simd.pset(32)
+                            for r in T.serial(RP):
+                                w = T.simd.vld(wts[i, r], dist="BRC_B32")
+                                for ck in T.serial(chunk_d // 128):
+                                    v = T.simd.vld(tmp[r, ck * 128])
+                                    lo = T.simd.vadd(
+                                        T.simd.vld(acc[r, ck * 128]),
+                                        T.simd.vmul(T.simd.vcvt(v, accum_dtype, part=0), w, mask32),
+                                        mask32,
+                                    )
+                                    hi = T.simd.vadd(
+                                        T.simd.vld(acc[r, ck * 128 + 64]),
+                                        T.simd.vmul(T.simd.vcvt(v, accum_dtype, part=1), w, mask32),
+                                        mask32,
+                                    )
+                                    T.simd.vsts(acc[r, ck * 128], lo, mask32)
+                                    T.simd.vsts(acc[r, ck * 128 + 64], hi, mask32)
+                    else:
+                        with (T.SimdVF() if simd_merge else T.SimtVF(threads=threads)):
+                            for r, c in T.Parallel(RP, chunk_d):
+                                if partial_dtype == accum_dtype:
+                                    acc[r, c] = acc[r, c] + tmp[r, c] * wts[i, r]
+                                else:
+                                    acc[r, c] = acc[r, c] + T.cast(tmp[r, c], accum_dtype) * wts[i, r]
+            else:
+                for i in T.serial(NS):
+                    T.copy(
+                        O_partial[i, b, h0:h0 + RP, dc * chunk_d:(dc + 1) * chunk_d],
+                        tmp,
+                    )
+                    if simd_widen:
+                        # fp16 partial on the vector unit: widen with vcvt and
+                        # accumulate in the de-interleaved lane layout that
+                        # vcvt produces (even columns in the low 64 lanes of a
+                        # 128-column group, odd columns in the high 64).
+                        with T.SimdVF():
+                            mask32 = T.simd.pset(32)
+                            for r in T.serial(RP):
+                                w = T.simd.vld(wts[i, r], dist="BRC_B32")
+                                for ck in T.serial(chunk_d // 128):
+                                    v = T.simd.vld(tmp[r, ck * 128])
+                                    lo = T.simd.vadd(
+                                        T.simd.vld(acc[r, ck * 128]),
+                                        T.simd.vmul(T.simd.vcvt(v, accum_dtype, part=0), w, mask32),
+                                        mask32,
+                                    )
+                                    hi = T.simd.vadd(
+                                        T.simd.vld(acc[r, ck * 128 + 64]),
+                                        T.simd.vmul(T.simd.vcvt(v, accum_dtype, part=1), w, mask32),
+                                        mask32,
+                                    )
+                                    T.simd.vsts(acc[r, ck * 128], lo, mask32)
+                                    T.simd.vsts(acc[r, ck * 128 + 64], hi, mask32)
+                    else:
+                        with (T.SimdVF() if simd_merge else T.SimtVF(threads=threads)):
+                            for r, c in T.Parallel(RP, chunk_d):
+                                if partial_dtype == accum_dtype:
+                                    acc[r, c] = acc[r, c] + tmp[r, c] * wts[i, r]
+                                else:
+                                    acc[r, c] = acc[r, c] + T.cast(tmp[r, c], accum_dtype) * wts[i, r]
+
+            if simd_widen:
+                # acc was stored de-interleaved by the widening pass: inside each
+                # 128-column group, k = c//2 + (c%2)*64. Normalise and write the
+                # contiguous fp16 output tile in one scalar pass (cheap: one pass
+                # over the tile, versus once per split on the old path).
+                with T.SimtVF(threads=threads):
+                    for r, c in T.Parallel(RP, chunk_d):
+                        cc = c % 128
+                        k = (c // 128) * 128 + cc // 2 + (cc % 2) * 64
+                        out_h[r, c] = acc[r, k] / row_sum[r]
+            elif simd_norm:
+                # fp16 output normalisation on the vector unit: the generic
+                # SimdVF lowering rejects the implicit fp32->fp16 store cast
+                # ("unsupported expr: T.Cast(float16, ...)"), so it is spelled
+                # out with vdiv + vcvt(PK_B32) like the dense phase-1 exp pass.
+                with T.SimdVF():
+                    mask32 = T.simd.pset(32)
+                    mask16 = T.simd.pset(16)
+                    for r in T.serial(RP):
+                        rs = T.simd.vld(row_sum[r], dist="BRC_B32")
+                        for ck in T.serial(chunk_d // 64):
+                            q = T.simd.vdiv(T.simd.vld(acc[r, ck * 64]), rs, mask32)
+                            T.simd.vsts(
+                                out_h[r, ck * 64],
+                                T.simd.vcvt(q, dtype),
+                                mask16,
+                                dist="PK_B32",
+                            )
+            else:
+                with T.SimtVF(threads=threads):
+                    for r, c in T.Parallel(RP, chunk_d):
+                        out_h[r, c] = acc[r, c] / row_sum[r]
+
+            T.copy(out_h, O[b, h0:h0 + RP, dc * chunk_d:(dc + 1) * chunk_d])
+
+    return merge_main
+
+
 def compile_mla_decode_paged(
     batch,
     heads,
@@ -394,18 +679,16 @@ def compile_mla_decode_paged(
 
     Defaults are the measured optimum for the DeepSeek page geometry
     (``block_size=64``): ``block_N=64`` (one page per tile), ``chunk_d=128`` and
-    ``vector_mode="simd_rc"``. The dense kernel's full-SIMD modes are rejected
-    here on purpose: a per-page score tile is only 64 columns wide, so the
-    explicit MicroAPI path measured no gain (phase 1 49.2 vs 49.1 us) and only
-    adds UB pressure.
+    ``vector_mode="simd_rc"``. The full-SIMD modes are rejected here on purpose:
+    a per-page score tile is only 64 columns wide, so the explicit MicroAPI path
+    measured no gain (phase 1 49.2 vs 49.1 us) and only adds UB pressure.
 
     ``partial_dtype`` must be the same on both phases: the shared merge kernel
     declares the ``O_partial`` input with this dtype. The ``out_idx`` positions of
     phase 1 are unchanged (only the element type of output 6 changes).
 
     ``vector_mode`` is forwarded to phase 1 (see ``mla_decode_paged_fwd``); the
-    merge kernel keeps the fp32 thread-parallel accumulate because it is latency
-    bound, not vector bound.
+    merge kernel is the shared phase-2 kernel defined in this module.
     """
     _, chunk_d, merge_chunk_d = pick_tiling(
         max_pages * block_size, dim, block_N, chunk_d, merge_chunk_d

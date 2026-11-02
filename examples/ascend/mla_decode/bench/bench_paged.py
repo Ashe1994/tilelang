@@ -1,4 +1,8 @@
-"""Paged MLA decode: correctness guard + wall-clock benchmark vs the dense kernel."""
+"""Paged MLA decode: correctness guard + wall-clock benchmark vs the native decode kernel.
+
+The native kernel (``example_mla_decode.py``, one launch, one KV pass per core) is
+the reference implementation; the paged kernel is the optimized split-KV path.
+"""
 
 import math
 import statistics
@@ -18,6 +22,7 @@ except ImportError:  # pragma: no cover
 PATH = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PATH))
 
+from example_mla_decode import compile_mla_decode
 from example_mla_decode_paged import compile_mla_decode_paged
 from test_mla_decode_paged import make_paged, ref_paged
 
@@ -39,10 +44,8 @@ def main():
     scale = (D + PE) ** -0.5
     flops = 2 * 1 * 128 * 8192 * (D + PE) + 2 * 1 * 128 * 8192 * D
 
-    from example_mla_decode_splitk import compile_mla_decode_splitk
-
-    dense = compile_mla_decode_splitk(batch=1, heads=128, kv_len=8192, dim=D, pe_dim=PE,
-                                      softmax_scale=scale, num_split=16)
+    dense = compile_mla_decode(batch=1, heads=128, kv_len=8192, dim=D, pe_dim=PE,
+                               softmax_scale=scale)
     g = torch.Generator(device="cpu").manual_seed(0)
     qd = torch.randn((1, 128, D), generator=g).half().npu()
     qpd = torch.randn((1, 128, PE), generator=g).half().npu()
@@ -51,7 +54,7 @@ def main():
     dense(qd, qpd, kvd, kpd)
     torch.npu.synchronize()
     d_us = statistics.median([wall(lambda: dense(qd, qpd, kvd, kpd)) for _ in range(3)])
-    print(f"PGDENSE dense_optimized_us={d_us:.1f} tflops={flops / d_us / 1e6:.2f}", flush=True)
+    print(f"NATIVEDENSE native_us={d_us:.1f} tflops={flops / d_us / 1e6:.2f}", flush=True)
 
     for name, batch, seq_len, bs, bn, ns in CASES:
         q, qp, kv, kp, table, seqlens, mp = make_paged(batch, [seq_len], bs, seed=5)
@@ -67,7 +70,7 @@ def main():
         print(
             f"PG {name} bs={bs} bn={bn} ns={ns} e2e_us={us:.1f} "
             f"tflops={flops / us / 1e6:.2f} rel={rel:.5f} "
-            f"{'PASS' if rel < 1e-2 else 'FAIL'} paged_over_dense={us / d_us:.3f}",
+            f"{'PASS' if rel < 1e-2 else 'FAIL'} speedup_vs_native={d_us / us:.2f}",
             flush=True,
         )
 

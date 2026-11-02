@@ -194,6 +194,11 @@ negotiable in the current tilelang release:
 * `block_N=32` (to free UB for a hand-written double buffer) costs +43% phase 1.
 * page 128 and page 64 are equally fast; extra splits (`num_split=32`) are
   slower.
+* restructuring the GEMMs does not pay either: one QK GEMM over a packed
+  576-wide `dim+pe_dim` measured +6.7% phase 1, and wider (2*chunk_d) PV GEMMs
+  are rejected by the compiler (L0C->UB copy must be zero-origin). The
+  scheduler knobs (`num_stages`, merge `rows_per_block`/`num_stages`/`chunk_d`)
+  are all at their measured optimum.
 * the remaining large win is Cube/Vector overlap: the auto-scheduler cannot
   overlap the softmax of tile i with the QK of tile i+1 across the ping-pong
   dependency. Reaching the 27.9 us ceiling needs a hand-written

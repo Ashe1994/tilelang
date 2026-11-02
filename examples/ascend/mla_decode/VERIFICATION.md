@@ -106,6 +106,13 @@ kernel is linear in the data volume and no tier is bandwidth limited.
 | `unit_flag_ctrl=3` (pipelined MAD+FIXPIPE) on gemm / dual_copy | compiles, hangs at run time (needs a matching manual flag protocol) | closed |
 | single KV read (reuse the K tile for PV) | L1 GEMM is NT-only (`trans_A=False, trans_B=True`); using one tile for both gemms hits a layout conflict; UB->L1 `transpose=True` compiles but silently ignores the transpose (wrong values); L1->L1 transpose does not compile | closed |
 | page 128 | 57.1 us vs 56.9 us for page 64 — no win | closed |
+| QK as one GEMM over a packed `dim+pe_dim` (K=576) instead of the pe-half + content-half pair | correct (rel 5.4e-4) but phase 1 49.1 -> 52.4 us (+6.7%), e2e 56.9 -> 60.5 us | closed |
+| PV GEMMs `2*chunk_d` (256) wide | rejected by the compiler: `L0C->UB compact source requires zero-origin trailing matrix dimensions`; the full-width UB accumulator would also exceed the 221184 B budget | closed |
+| phase-1 `num_stages=3` | 49.19 vs 49.22 us | closed |
+| merge `rows_per_block=32` / `num_stages=6` | 13.20 / 12.37 us vs 12.26 us | closed |
+| merge `chunk_d` 256 / 512 | e2e 57.7 / 60.8 us vs 57.0 us | closed |
+| `threads` 512 / 2048 | e2e 57.2 / 57.8 us vs 57.0 us | closed |
+| merge `tmp` x4 versions on the paged (fp32-partial) merge | e2e 56.85 -> 56.92 us, phase 1 49.11 -> 49.05 us: no effect (it helped only the removed fp16 dense merge) | closed |
 
 ## 7. Trust conditions on a shared host
 
@@ -131,10 +138,11 @@ python bench/parse_pipes.py paged=/dev/shm/prof/paged
 
 ## 9. Open items
 
-1. **merge split-loop `tmp` x4 multi-version** — merge-only A/B measured
-   9.28 -> 8.79 us (-5.3%, identical results) but under host load 300-900, so
-   only the medians were stable; expected e2e effect ~-0.5 us. Needs a quiet
-   window before it is adopted.
+1. ~~merge split-loop `tmp` x4 multi-version~~ — measured on the paged pipeline
+   at load 27-33: e2e 56.85 -> 56.92 us and phase 1 49.11 -> 49.05 us, i.e. no
+   effect. The merge-only win (9.21 -> 8.68 us) exists only for the fp16
+   partials path (the dense kernel, removed); the paged merge uses fp32
+   partials and the versioning does not help. Closed.
 2. **paged full-SIMD vector modes** (`simd` / `simd_exp`) are not implemented in
    this kernel; the earlier fp32-partial build measured `simd_exp` at +56%, so it
    stays unported.

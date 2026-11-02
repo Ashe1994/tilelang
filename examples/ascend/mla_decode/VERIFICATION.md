@@ -141,6 +141,10 @@ no tier is bandwidth limited.
 | `threads` 512 / 2048 | e2e 57.2 / 57.8 us vs 57.0 us | closed |
 | merge `tmp` x4 versions on the paged (fp32-partial) merge | e2e 56.85 -> 56.92 us, phase 1 49.11 -> 49.05 us: no effect | closed |
 | page 128 | identical to page 64 in both schedules | closed |
+| three KV tiles in flight (`TILE_SLOTS=3`) | phase 1 50.9 vs 43.6 us, e2e 58.7 vs 52.6 us; L1 at ~496 KiB leaves the scheduler no room | closed |
+| V^T double-buffered and prefetched in the copy phase | phase 1 45.1 vs 43.6 us, e2e 52.9 vs 52.6 us (same run) | closed |
+| reorder: slot-0 PV placed between the two softmax passes | e2e 56.8 vs 53.6 us (same run); the scheduler prefers the batched phases | closed |
+| two-tile pair loop `num_stages` 2 / 3 | 53.65 / 53.85 us vs 53.60 us e2e | closed |
 
 ## 8. Trust conditions on a shared host
 
@@ -171,10 +175,13 @@ the benchmark would run.
 ## 10. Open items
 
 1. **Cube/Vector overlap, part 2** - the two-tile schedule overlaps QK with the
-   other tile's softmax. Overlapping the PV phase with the other tile's softmax
-   (or keeping three tiles in flight) would push phase 1 below 40 us; the UB
-   score buffer reuse is the current blocker (a second UB score tile needs
-   ~16 KiB that the 221184 B budget does not have).
+   other tile's softmax. Pushing further is *not* reachable by rearranging this
+   kernel: three slots, V^T double buffering, PV/softmax reordering and a deeper
+   pair loop all measured slower or neutral (section 7), so the batched-phase
+   two-tile schedule is a local optimum for this auto-scheduler. The next step
+   would be a hand-written `T.MixedKernel` with explicit `T.Cube()` /
+   `T.Vector()` regions and manual flags, or compiler support for cross-iteration
+   multi-buffering.
 2. **paged full-SIMD vector modes** (`simd` / `simd_exp`) are not implemented in
    this kernel; the earlier fp32-partial build measured `simd_exp` at +56%.
 3. **KV single read** remains blocked by the NT-only L1 GEMM and the layout

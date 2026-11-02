@@ -213,10 +213,12 @@ negotiable in the current tilelang release:
   are all at their measured optimum.
 * Cube/Vector overlap is only partially solved: the two-tile schedule overlaps
   the QK of one tile with the softmax of the other (phase 1 47.7 -> 43.6 us), but
-  the PV phase and the second softmax still serialise. Pushing further (PV of
-  tile i overlapping softmax of tile i+1, or 3+ tiles in flight) needs a
-  hand-written `T.MixedKernel` with explicit `T.Cube()` / `T.Vector()` regions
-  and manual flags, or compiler support for cross-iteration multi-buffering.
+  the PV phase and the second softmax still serialise. Pushing further is not
+  reachable by rearranging this kernel -- three slots, V^T double buffering,
+  PV/softmax reordering and a deeper pair loop all measured slower or neutral.
+  The next step would be a hand-written `T.MixedKernel` with explicit
+  `T.Cube()` / `T.Vector()` regions and manual flags, or compiler support for
+  cross-iteration multi-buffering.
 
 ## Running
 

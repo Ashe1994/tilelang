@@ -7,17 +7,17 @@ DeepSeek-style multi-head latent attention (MLA) decode on Ascend 950PR
 
 Two kernels live here:
 
-* `example_mla_decode.py` — the **native decode kernel**: one launch, one KV pass
+* `example_mla_decode.py` - the **native decode kernel**: one launch, one KV pass
   per core, no split-KV. It is the reference implementation and the baseline for
   the speedups below.
-* `example_mla_decode_paged.py` — the **paged decode kernel**: the KV cache is
+* `example_mla_decode_paged.py` - the **paged decode kernel**: the KV cache is
   addressed through `block_table` + `cache_seqlens`, the KV blocks are split
   across cores, and a second kernel merges the per-split partials. Phase 1 and
   the merge kernel live in this one module.
 
 Measured on the reference shape (batch=1, heads=128, kv_len=8192, dim=512,
-pe_dim=64): native 1549.4 us, paged page 64 **56.9-57.3 us** = **27.2x**,
-40.0 TFLOPS, relative error 5.4e-4 against the fp32 torch reference.
+pe_dim=64): native 1549.4 us, paged page 64 **52.6 us** = **29.5x**,
+43.4 TFLOPS, relative error 5.4e-4 against the fp32 torch reference.
 
 ## Files
 
@@ -93,6 +93,15 @@ no gain and only adds UB pressure), `partial_dtype="float32"` (fp16 partials
 measured slower here), `merge_rows=16`, `merge_stages=4`,
 `merge_vector_mode="simd"`.
 
+Phase 1 runs a **two-tile CV-overlap schedule** for the shipped page geometry
+(`select_phase1_kernel()` picks it for `block_N=64`, `chunk_d=128`, one page
+chunk per tile): K/K_pe of two KV tiles are prefetched, both QK GEMMs are
+issued, and only then does the vector unit run the two softmax passes and the
+two PV passes, so the cube keeps working while the vector units run the softmax
+of the other tile. The two QK results live in two L0C tiles; the UB score buffer
+is reused, which keeps the dynamic UBUF budget unchanged. Other geometries
+(`block_N=128` with 64-token pages) keep the single-tile loop.
+
 ## Performance
 
 Reference shape, `do_bench(backend="event", _n_warmup=10, _n_repeat=50)`, 3
@@ -102,13 +111,15 @@ the verification report).
 | case | e2e | TFLOPS | rel | speedup vs native |
 |---|---:|---:|---:|---:|
 | native decode (num_split=1) | 1549.4 us | 1.47 | 6.2e-4 | 1.0x |
-| **paged, page 64, block_N=64, ns=16 (default)** | **56.9 us** | **40.1** | 5.4e-4 | **27.2x** |
-| paged, page 128 | 57.1 us | 40.0 | 5.5e-4 | 27.1x |
-| paged, block_N=128 (previous default) | 60.8 us | 37.5 | 5.4e-4 | 25.5x |
-| paged, num_split=32 | 73.8 us | 30.9 | 5.4e-4 | 21.0x |
+| **paged, page 64, block_N=64, ns=16 (default, two-tile schedule)** | **52.6 us** | **43.4** | 5.4e-4 | **29.5x** |
+| paged, page 128 (two-tile schedule) | 53.0 us | 43.1 | 5.5e-4 | 29.3x |
+| paged, block_N=128 (single-tile schedule) | 59.3 us | 38.5 | 5.4e-4 | 26.1x |
+| paged, num_split=32 (two-tile schedule) | 70.6 us | 32.3 | 5.4e-4 | 21.9x |
 
-Page 128 and page 64 are equally fast; `block_N=128` and extra splits are
-slower, which is why the defaults are what they are.
+Page 128 and page 64 are equally fast; `block_N=128` falls back to the
+single-tile schedule and is slower; extra splits are slower. The two-tile
+schedule is worth **-7.6% end-to-end / -8.6% phase 1** against the single-tile
+schedule on the reference shape.
 
 ## Profile (msprof)
 
@@ -121,38 +132,39 @@ msprof op --warm-up=10 --launch-count=5 \
 python bench/parse_pipes.py paged=/dev/shm/prof/paged
 ```
 
-Paged phase 1 — 47.7 us (block dim 16; mix kernel = 16 AIC + 32 AIV):
+Paged phase 1 - 43.6 us with the two-tile schedule (block dim 16; mix kernel =
+16 AIC + 32 AIV):
 
 | pipe | busy | share of duration |
 |---|---:|---:|
-| AIC cube (MAD) | 10.55 us | 22.1% |
-| AIC mte2 (GM->L1) | 13.62 us | 28.6% |
-| AIC mte1 (L1->L0) | 7.77 us | 16.3% |
-| AIC fixpipe (L0C->UB) | 6.75 us | 14.2% |
-| AIC scalar | 2.31 us | 4.9% |
-| AIV vec | 27.86 us | 58.5% |
-| AIV mte3 (UB->GM) | 2.21 us | 4.6% |
+| AIC cube (MAD) | 10.55 us | 24.2% |
+| AIC mte2 (GM->L1) | 13.22 us | 30.3% |
+| AIC mte1 (L1->L0) | 7.90 us | 18.1% |
+| AIC fixpipe (L0C->UB) | 7.86 us | 18.0% |
+| AIC scalar | 1.99 us | 4.6% |
+| AIV vec | 29.05 us | 66.7% |
+| AIV mte3 (UB->GM) | 2.64 us | 6.1% |
 
-* waits: `aiv_vec_wait` 86.1%, `aiv_mte3_wait` 95.3%, `aic_cube_wait` 95.1%,
-  `aic_mte1_wait` 96.5%, **`aic_mte2_wait` 61.5%**
+* waits: `aiv_vec_wait` 84.4%, `aiv_mte3_wait` 94.7%, `aic_cube_wait` 94.5%,
+  `aic_mte1_wait` 95.3%, **`aic_mte2_wait` 56.8%**
 * MTE instruction counts: **mte2 166, mte1 178**
-* L2 read hit (AIC) 53.1%; GM->L1 1232 KB/block, pipe bandwidth usage 15.2%
-* achieved 47.9 TFLOPS (11.1% of the fp16 cube peak) and 424 GB/s (10.6% of the
+* L2 read hit (AIC) 53.4%; GM->L1 1232 KB/block, pipe bandwidth usage 16.6%
+* achieved 52.4 TFLOPS (12.1% of the fp16 cube peak) and 463 GB/s (11.6% of the
   4 TB/s GM peak)
 
-The split of the wall clock is the dependency chain, not a single saturated
-unit: the ideal cube/vector overlap ceiling is
-`max(cube 10.55, mte2 13.62, vec 27.86) = 27.9 us` against 47.7 us measured.
-The paged kernel carries ~1.6x the MTE2 instructions of the dense variant
-because every page-chunk operand needs its own copy (166 vs 102), and that is
-what keeps `aic_mte2_wait` at 61%.
+The two-tile schedule raises the vector-unit occupancy from 58.5% to 66.7% of
+the duration and cuts the wall clock by 8.6% (single-tile phase 1: 47.7 us).
+The ideal cube/vector overlap ceiling is
+`max(cube 10.55, mte2 13.22, vec 29.05) = 29.1 us` against 43.6 us measured, so
+roughly half of the dependency-chain stall is still there; it needs the PV and
+softmax phases of the two tiles to overlap as well, not just QK with softmax.
 
-Bandwidth utilisation across data volume (measured 2026-10-30 with the then
-shipped sweep driver; the paged kernel is unchanged since): paged throughput
-49.3 GB/s at 0.56 MiB of KV cache up to 438.9 GB/s at 72 MiB, i.e. 1.2% -> 11.0%
-of the 4 TB/s peak. No tier is bandwidth limited; the fixed per-launch cost
-(~12-15 us) dominates the small tiers and the kernel is linear in the data
-volume above ~8 MiB.
+Bandwidth utilisation across data volume (page 64, batch 1, two-tile schedule
+where the geometry allows it): 467 GB/s at 1 MiB of KV cache up to 526 GB/s at
+72 MiB, i.e. 11.7% -> 13.2% of the 4 TB/s peak; e2e 23.2 / 52.6 / 153.9 / 287.2
+us for kv_len 1024 / 8192 / 32768 / 65536. No tier is bandwidth limited; the
+fixed per-launch cost dominates the small tiers and the kernel is linear in the
+data volume above ~8 MiB.
 
 ## Platform constraints
 
@@ -199,11 +211,12 @@ negotiable in the current tilelang release:
   are rejected by the compiler (L0C->UB copy must be zero-origin). The
   scheduler knobs (`num_stages`, merge `rows_per_block`/`num_stages`/`chunk_d`)
   are all at their measured optimum.
-* the remaining large win is Cube/Vector overlap: the auto-scheduler cannot
-  overlap the softmax of tile i with the QK of tile i+1 across the ping-pong
-  dependency. Reaching the 27.9 us ceiling needs a hand-written
-  `T.MixedKernel` with explicit `T.Cube()` / `T.Vector()` regions and manual
-  flags, or compiler support for cross-iteration multi-buffering.
+* Cube/Vector overlap is only partially solved: the two-tile schedule overlaps
+  the QK of one tile with the softmax of the other (phase 1 47.7 -> 43.6 us), but
+  the PV phase and the second softmax still serialise. Pushing further (PV of
+  tile i overlapping softmax of tile i+1, or 3+ tiles in flight) needs a
+  hand-written `T.MixedKernel` with explicit `T.Cube()` / `T.Vector()` regions
+  and manual flags, or compiler support for cross-iteration multi-buffering.
 
 ## Running
 

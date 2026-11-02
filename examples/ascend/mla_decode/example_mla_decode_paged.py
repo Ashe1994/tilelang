@@ -409,6 +409,382 @@ def mla_decode_paged_fwd(
     return main
 
 
+def mla_decode_paged_fwd_dual(
+    batch,
+    heads,
+    num_slots,
+    dim,
+    pe_dim,
+    block_size,
+    max_pages,
+    block_H=128,
+    block_N=64,
+    chunk_d=128,
+    softmax_scale=None,
+    num_split=16,
+    threads=1024,
+    num_stages=2,
+    fuse_rescale=True,
+    ml_width=8,
+    tiles_per_core=None,
+    partial_dtype="float32",
+    vector_mode="simd_rc",
+    stage_cols=None,
+):
+    """Phase 1: per-split partial output + log-sum-exp over a paged KV cache.
+
+    ``ml_width`` is the row width of the ``ML`` tensor. Only column 0 is used; the
+    row is padded to a DMA granularity. The paged kernel carries two score tiles
+    and needs the 6 KiB that the dense kernel spends on a 32-wide row.
+
+    ``partial_dtype`` is the dtype of the published ``O_partial`` ("float32" or
+    "float16"). The merge kernel defined in this module must be compiled with the
+    same value.
+
+    ``vector_mode`` selects the programming model of the PV rescale/accumulate
+    pass, the largest elementwise pass of a tile: ``"simd_rc"`` (default) runs
+    ``o = o*alpha + pv`` as ``T.SimdVF`` vector instructions (64 fp32 lanes per
+    instruction), ``"simt"`` restores the original thread-parallel code for A/B
+    testing. It falls back to ``T.SimtVF`` automatically when ``chunk_d`` is not
+    a whole number of 64-lane registers. The two SIMD *exp* modes of the dense
+    kernel are not available here: they need UB headroom this kernel does not
+    have (the attempt overflowed UB at ``page == block_N == 128``).
+    """
+    scale = float(softmax_scale) if softmax_scale is not None else (dim + pe_dim) ** -0.5
+    dtype = "float16"
+    accum_dtype = "float32"
+    assert partial_dtype in (accum_dtype, dtype), (
+        'partial_dtype must be "float32" or "float16"'
+    )
+
+    ROWS = block_H // 2
+    NUM_M_TILES = heads // block_H
+    NUM_DC = dim // chunk_d
+    NS = num_split
+    NUM_BLOCKS = batch * NUM_M_TILES * NS
+
+    # fp16 publish staging width, in output columns. The dense kernel can afford a
+    # full-width [ROWS, chunk_d] fp16 staging buffer; this paged kernel cannot:
+    # the full-width 16 KiB buffer leaves the auto-scheduler no UB headroom to
+    # multi-buffer phase 1 (e2e 57.0 -> 68.7 us), and even 32-column slices are
+    # slower than writing fp32 (57.0 -> 59.4 us). fp32 therefore stays this
+    # kernel's default and the fp16 path is only for callers that want the merge
+    # traffic halved; ``stage_cols`` overrides the slice width for experiments.
+    STAGE_COLS = min(chunk_d, 32) if stage_cols is None else min(stage_cols, chunk_d)
+    NUM_SLICES = chunk_d // STAGE_COLS
+
+    # pages per tile, and the rows of a tile that each page contributes
+    NUM_PC = max(1, block_N // block_size)
+    PAGE_ROWS = block_N if NUM_PC == 1 else block_size
+
+    assert block_H == 128, "block_H must be 128 (T.dual_copy L0C->UB requires M=128)"
+    assert heads % block_H == 0, "heads must be a multiple of block_H"
+    assert dim % chunk_d == 0, "dim must be a multiple of chunk_d"
+    assert block_size % block_N == 0 or block_N % block_size == 0, (
+        "a block_N tile must nest inside a page or span whole pages"
+    )
+    assert NUM_PC * PAGE_ROWS == block_N, "tile assembly must cover exactly block_N rows"
+    assert block_size % 16 == 0 and pe_dim % 16 == 0 and dim % 16 == 0
+    assert num_slots >= batch * max_pages * block_size, "num_slots must cover every table entry"
+    # Upper bound on the tiles any single core can own, as a compile-time constant.
+    TILES_PER_CORE = tiles_per_core or -(-(-(-max_pages * block_size // block_N)) // max(1, NS))
+    assert TILES_PER_CORE >= 1
+
+    # The PV rescale/accumulate is the one phase-1 pass that both wins and fits
+    # the tight paged UB budget; 64 fp32 lanes per vector register means the
+    # output-column chunk must be a whole number of registers.
+    assert vector_mode in ("simt", "simd_rc"), (
+        "the paged kernel supports vector_mode 'simt'|'simd_rc'; the SIMD exp "
+        "modes need the dense kernel's UB headroom"
+    )
+    simd_rc = vector_mode == "simd_rc" and chunk_d % 64 == 0
+
+    @T.prim_func
+    def main(
+        Q: T.Tensor((batch, heads, dim), dtype),
+        Q_pe: T.Tensor((batch, heads, pe_dim), dtype),
+        KV: T.Tensor((num_slots, dim), dtype),
+        K_pe: T.Tensor((num_slots, pe_dim), dtype),
+        block_table: T.Tensor((batch, max_pages), "int32"),
+        cache_seqlens: T.Tensor((batch,), "int32"),
+        O_partial: T.Tensor((NS, batch, heads, dim), partial_dtype),
+        ML: T.Tensor((NS, batch, heads, ml_width), accum_dtype),
+    ):
+        with T.Kernel(NUM_BLOCKS) as bx:
+            b = bx // (NUM_M_TILES * NS)
+            rem_blk = bx % (NUM_M_TILES * NS)
+            h0 = (rem_blk // NS) * block_H
+            sid = rem_blk % NS
+
+            # ------------------------------ L1 ------------------------------
+            # CV-overlap prototype: two KV tiles are in flight. K/K_pe are
+            # double-buffered (L1) and the two QK results live in two L0C tiles,
+            # so slot 1's QK can run while slot 0's softmax is on the vector
+            # units; the single score tile in UB is reused, which keeps the
+            # dynamic UBUF budget unchanged.
+            TILE_SLOTS = 2
+            q_l1 = T.alloc_l1((block_H, dim), dtype)
+            q_pe_l1 = T.alloc_l1((block_H, pe_dim), dtype)
+            k_l1 = [
+                [T.alloc_l1((PAGE_ROWS, dim), dtype) for _ in range(NUM_PC)]
+                for _ in range(TILE_SLOTS)
+            ]
+            k_pe_l1 = [
+                [T.alloc_l1((PAGE_ROWS, pe_dim), dtype) for _ in range(NUM_PC)]
+                for _ in range(TILE_SLOTS)
+            ]
+            p_l1 = [
+                [T.alloc_l1((block_H, PAGE_ROWS), dtype) for _ in range(NUM_PC)]
+                for _ in range(TILE_SLOTS)
+            ]
+            v_l1 = [
+                [T.alloc_l1((chunk_d, PAGE_ROWS), dtype) for _ in range(NUM_DC)]
+                for _ in range(NUM_PC)
+            ]
+
+            # ------------------------------ L0C -----------------------------
+            s_l0c = [
+                [T.alloc_l0c((block_H, PAGE_ROWS), accum_dtype) for _ in range(NUM_PC)]
+                for _ in range(TILE_SLOTS)
+            ]
+            o_l0c = T.alloc_l0c((block_H, chunk_d), accum_dtype)
+
+            # ------------------------------ UB ------------------------------
+            s_ub = [T.alloc_shared((ROWS, PAGE_ROWS), accum_dtype) for _ in range(NUM_PC)]
+            p_ub = [T.alloc_shared((ROWS, PAGE_ROWS), dtype) for _ in range(NUM_PC)]
+            o_ub = [T.alloc_shared((ROWS, chunk_d), accum_dtype) for _ in range(NUM_DC)]
+            o_tmp_ub = T.alloc_shared((ROWS, chunk_d), accum_dtype)
+            ml_ub = T.alloc_shared((ROWS, ml_width), accum_dtype)
+            if partial_dtype != accum_dtype:
+                # fp16 publish staging: one output-column slice at a time, 4 KiB.
+                o_out_ub = T.alloc_shared((ROWS, STAGE_COLS), partial_dtype)
+
+            m_ub = T.alloc_shared((ROWS,), accum_dtype)
+            l_ub = T.alloc_shared((ROWS,), accum_dtype)
+            # one alpha per tile slot (slot 0's PV rescale must survive slot 1's
+            # softmax updating m_ub)
+            alpha_ub = [T.alloc_shared((ROWS,), accum_dtype) for _ in range(TILE_SLOTS)]
+
+
+            # The two-slot schedule needs the scheduler to version more shared
+            # memory than its default "shared" partition allows, while the
+            # physical dynamic UBUF budget still fits.
+            T.annotate_unlimit_memory("shared", "shared.l1")
+
+            T.copy(Q[b, h0:h0 + block_H, 0:dim], q_l1[0:block_H, 0:dim])
+            T.copy(Q_pe[b, h0:h0 + block_H, 0:pe_dim], q_pe_l1[0:block_H, 0:pe_dim])
+
+            with T.SimtVF(threads=threads):
+                for r in T.Parallel(ROWS):
+                    m_ub[r] = -T.infinity(accum_dtype)
+                    l_ub[r] = 0.0
+                for ob in o_ub:
+                    for r, c in T.Parallel(ROWS, chunk_d):
+                        ob[r, c] = 0.0
+
+            # ---- split of the live KV blocks over the NS cores ----
+            seqlen = cache_seqlens[b]
+            nblk = T.ceildiv(seqlen, block_N)
+            per = nblk // NS
+            extra = nblk % NS
+            loop_range = per + T.if_then_else(sid < extra, 1, 0)
+            first = per * sid + T.min(sid, extra)
+
+            # Two KV tiles per iteration: K/K_pe of both slots are prefetched and
+            # both QK GEMMs are issued, then slot 0's softmax runs while the cube
+            # finishes slot 1's QK, then slot 1's softmax, then the two PV passes.
+            for pair in T.Pipelined(T.ceildiv(loop_range, TILE_SLOTS), num_stages=1):
+                for ti, _t in enumerate(range(TILE_SLOTS)):
+                    kv_blk = first + pair * TILE_SLOTS + ti
+                    kv_blk_safe = T.min(kv_blk, first + loop_range - 1)
+                    pos = kv_blk_safe * block_N
+
+                    for pc, _kb in enumerate(k_l1[ti]):
+                        p_pos = pos + pc * PAGE_ROWS
+                        # clamp: the last tile can reach past the live pages
+                        page = block_table[b, T.min(p_pos // block_size, max_pages - 1)]
+                        kv_start = page * block_size + p_pos % block_size
+
+                        T.copy(KV[kv_start:kv_start + PAGE_ROWS, 0:dim], k_l1[ti][pc])
+                        T.copy(K_pe[kv_start:kv_start + PAGE_ROWS, 0:pe_dim], k_pe_l1[ti][pc])
+
+                # QK for both slots: the slot-1 GEMMs are issued before slot-0's
+                # softmax so the cube keeps working while the vector units run it.
+                for ti, _t in enumerate(range(TILE_SLOTS)):
+                    for pc, kb in enumerate(k_l1[ti]):
+                        T.gemm(
+                            q_pe_l1[0:block_H, 0:pe_dim],
+                            k_pe_l1[ti][pc],
+                            s_l0c[ti][pc],
+                            transpose_B=True,
+                            clear_accum=True,
+                        )
+                        T.gemm(
+                            q_l1[0:block_H, 0:dim],
+                            kb,
+                            s_l0c[ti][pc],
+                            transpose_B=True,
+                            clear_accum=False,
+                        )
+
+
+                for ti, _t in enumerate(range(TILE_SLOTS)):
+                    kv_blk = first + pair * TILE_SLOTS + ti
+                    kv_blk_safe = T.min(kv_blk, first + loop_range - 1)
+                    pos = kv_blk_safe * block_N
+                    valid = pair * TILE_SLOTS + ti < loop_range
+                    for pc, sc in enumerate(s_l0c[ti]):
+                        T.dual_copy(sc, s_ub[pc][0:ROWS, 0:PAGE_ROWS])
+
+                    with T.SimtVF(threads=threads):
+                        # scale + mask, positions are global; a slot past the
+                        # split's range is fully masked (-inf) and contributes 0.
+                        for pc, sb in enumerate(s_ub):
+                            for r, c in T.Parallel(ROWS, PAGE_ROWS):
+                                sb[r, c] = T.if_then_else(
+                                    valid,
+                                    T.if_then_else(
+                                        pos + pc * PAGE_ROWS + c < seqlen,
+                                        sb[r, c] * scale,
+                                        -T.infinity(accum_dtype),
+                                    ),
+                                    -T.infinity(accum_dtype),
+                                )
+
+                        # One reducer accumulates across every page chunk, so the
+                        # combined row max needs no extra register set per page.
+                        red_max = T.alloc_reducer((ROWS,), accum_dtype, op="max")
+                        T.reducer_init(red_max)
+                        for pc, sb in enumerate(s_ub):
+                            for r, c in T.Parallel(ROWS, PAGE_ROWS):
+                                T.reducer_update(red_max[r], sb[r, c])
+                        tile_max = T.alloc_fragment((ROWS,), accum_dtype)
+                        T.finalize_reducer(red_max, tile_max)
+
+                        for r in T.Parallel(ROWS):
+                            new_m = T.max(m_ub[r], tile_max[r])
+                            alpha_ub[ti][r] = T.exp(m_ub[r] - new_m)
+                            m_ub[r] = new_m
+
+                        # exp and the fp16 cast happen in one pass: the separate
+                        # p_ub = s_ub copy was a full extra sweep of the tile.
+                        for pc, sb in enumerate(s_ub):
+                            pbw = p_ub[pc]
+                            for r, c in T.Parallel(ROWS, PAGE_ROWS):
+                                e = T.exp(sb[r, c] - m_ub[r])
+                                sb[r, c] = e
+                                pbw[r, c] = e
+
+                        red_sum = T.alloc_reducer((ROWS,), accum_dtype, op="sum")
+                        T.reducer_init(red_sum)
+                        for pc, sb in enumerate(s_ub):
+                            for r, c in T.Parallel(ROWS, PAGE_ROWS):
+                                T.reducer_update(red_sum[r], sb[r, c])
+                        tile_sum = T.alloc_fragment((ROWS,), accum_dtype)
+                        T.finalize_reducer(red_sum, tile_sum)
+
+                        for r in T.Parallel(ROWS):
+                            l_ub[r] = l_ub[r] * alpha_ub[ti][r] + tile_sum[r]
+
+                        if not fuse_rescale:
+                            for ob in o_ub:
+                                for r, c in T.Parallel(ROWS, chunk_d):
+                                    ob[r, c] = ob[r, c] * alpha_ub[ti][r]
+
+                    for pc, pb in enumerate(p_ub):
+                        T.dual_copy(
+                            pb[0:ROWS, 0:PAGE_ROWS],
+                            p_l1[ti][pc][0:block_H, 0:PAGE_ROWS],
+                        )
+
+                # PV for both slots; V^T is not double-buffered (it is only
+                # needed inside one slot's PV phase) to keep the L1 budget.
+                for ti, _t in enumerate(range(TILE_SLOTS)):
+                    kv_blk = first + pair * TILE_SLOTS + ti
+                    kv_blk_safe = T.min(kv_blk, first + loop_range - 1)
+                    pos = kv_blk_safe * block_N
+                    for pc, _vpc in enumerate(v_l1):
+                        p_pos = pos + pc * PAGE_ROWS
+                        page = block_table[b, T.min(p_pos // block_size, max_pages - 1)]
+                        kv_start = page * block_size + p_pos % block_size
+                        for i, vb in enumerate(v_l1[pc]):
+                            T.copy(
+                                KV[
+                                    kv_start:kv_start + PAGE_ROWS,
+                                    i * chunk_d:(i + 1) * chunk_d,
+                                ],
+                                vb,
+                                transpose=True,
+                            )
+                    for i, _junk in enumerate(o_ub):
+                        for pc, pb in enumerate(p_ub):
+                            T.gemm(p_l1[ti][pc], v_l1[pc][i], o_l0c, transpose_B=True,
+                                   clear_accum=(pc == 0))
+                        T.dual_copy(o_l0c, o_tmp_ub[0:ROWS, 0:chunk_d])
+                        if simd_rc:
+                            with T.SimdVF():
+                                if fuse_rescale:
+                                    for r, c in T.Parallel(ROWS, chunk_d):
+                                        o_ub[i][r, c] = o_ub[i][r, c] * alpha_ub[ti][r] + o_tmp_ub[r, c]
+                                else:
+                                    for r, c in T.Parallel(ROWS, chunk_d):
+                                        o_ub[i][r, c] = o_ub[i][r, c] + o_tmp_ub[r, c]
+                        else:
+                            with T.SimtVF(threads=threads):
+                                if fuse_rescale:
+                                    for r, c in T.Parallel(ROWS, chunk_d):
+                                        o_ub[i][r, c] = o_ub[i][r, c] * alpha_ub[ti][r] + o_tmp_ub[r, c]
+                                else:
+                                    for r, c in T.Parallel(ROWS, chunk_d):
+                                        o_ub[i][r, c] = o_ub[i][r, c] + o_tmp_ub[r, c]
+
+            # ---- publish partials: normalised output + row log-sum-exp ----
+            # A split with zero KV blocks keeps l_ub == 0; guard the divide so it
+            # publishes zeros. Its lse is -inf, so the merge gives it weight 0.
+            if partial_dtype == accum_dtype:
+                with T.SimtVF(threads=threads):
+                    for ob in o_ub:
+                        for r, c in T.Parallel(ROWS, chunk_d):
+                            ob[r, c] = T.if_then_else(l_ub[r] > 0.0, ob[r, c] / l_ub[r], 0.0)
+
+                for i, ob in enumerate(o_ub):
+                    T.dual_copy(
+                        ob[0:ROWS, 0:chunk_d],
+                        O_partial[sid, b, h0:h0 + block_H, i * chunk_d:(i + 1) * chunk_d],
+                    )
+            else:
+                # fp16 partial: normalise into the 4 KiB fp16 staging buffer and
+                # stream it out column slice by column slice (see STAGE_COLS). The
+                # empty-split guard is kept so a zero-block split still publishes
+                # zeros. enumerate() keeps this a Python-level unroll (04-A5).
+                for i, ob in enumerate(o_ub):
+                    for s, _slice in enumerate(range(NUM_SLICES)):
+                        with T.SimtVF(threads=threads):
+                            for r, c in T.Parallel(ROWS, STAGE_COLS):
+                                o_out_ub[r, c] = T.if_then_else(
+                                    l_ub[r] > 0.0,
+                                    ob[r, s * STAGE_COLS + c] / l_ub[r],
+                                    0.0,
+                                )
+                        T.dual_copy(
+                            o_out_ub[0:ROWS, 0:STAGE_COLS],
+                            O_partial[
+                                sid, b, h0:h0 + block_H,
+                                i * chunk_d + s * STAGE_COLS:
+                                i * chunk_d + (s + 1) * STAGE_COLS,
+                            ],
+                        )
+
+            with T.SimtVF(threads=threads):
+                for r, c in T.Parallel(ROWS, ml_width):
+                    ml_ub[r, c] = 0.0
+                for r in T.Parallel(ROWS):
+                    ml_ub[r, 0] = m_ub[r] + T.log(l_ub[r])
+            T.dual_copy(ml_ub[0:ROWS, 0:ml_width], ML[sid, b, h0:h0 + block_H, 0:ml_width])
+
+    return main
+
+
 def mla_decode_merge(
     batch,
     heads,
@@ -650,6 +1026,23 @@ def mla_decode_merge(
     return merge_main
 
 
+def select_phase1_kernel(block_N, block_size, chunk_d, kv_hint=None, num_split=16):
+    """Return ``(phase1_builder, uses_dual_schedule)`` for a page geometry.
+
+    The two-tile CV-overlap schedule needs one page chunk per tile (its tile
+    slots double the K/V L1 buffers), is tuned for the shipped geometry
+    (``block_N=64``, ``chunk_d=128``) and only pays off when each core owns at
+    least two KV tiles -- with one tile per core the second (masked) slot is
+    pure overhead. ``kv_hint`` is the compile-time maximum live length
+    (``max_pages * block_size``). Every other geometry keeps the single-tile
+    loop.
+    """
+    num_pc = max(1, block_N // block_size)
+    enough_tiles = kv_hint is None or (kv_hint // block_N) >= 2 * max(1, num_split)
+    dual = num_pc == 1 and block_N == 64 and chunk_d == 128 and enough_tiles
+    return (mla_decode_paged_fwd_dual, True) if dual else (mla_decode_paged_fwd, False)
+
+
 def compile_mla_decode_paged(
     batch,
     heads,
@@ -694,8 +1087,12 @@ def compile_mla_decode_paged(
         max_pages * block_size, dim, block_N, chunk_d, merge_chunk_d
     )
 
+    fwd, _dual = select_phase1_kernel(
+        block_N, block_size, chunk_d, kv_hint=max_pages * block_size, num_split=num_split
+    )
+
     partial = tilelang.compile(
-        mla_decode_paged_fwd(
+        fwd(
             batch=batch,
             heads=heads,
             num_slots=num_slots,

@@ -21,7 +21,7 @@ except ImportError:  # pragma: no cover
 PATH = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PATH))
 
-from example_mla_decode_paged import mla_decode_paged_fwd
+from example_mla_decode_paged import select_phase1_kernel
 
 B, H, S, D, PE = 1, 128, 8192, 512, 64
 NS = 16
@@ -50,8 +50,11 @@ def main():
     table = perm[: B * max_pages].view(B, max_pages).contiguous().npu()
     seqlens = torch.tensor([S] * B, dtype=torch.int32).npu()
 
+    fwd, dual = select_phase1_kernel(
+        args.block_n, bs, 128, kv_hint=max_pages * bs, num_split=args.num_split
+    )
     kernel = tilelang.compile(
-        mla_decode_paged_fwd(
+        fwd(
             batch=B, heads=H, num_slots=num_slots, dim=D, pe_dim=PE,
             block_size=bs, max_pages=max_pages, block_N=args.block_n,
             num_split=args.num_split, softmax_scale=scale,
@@ -61,7 +64,7 @@ def main():
     op, ml = kernel(q, q_pe, kv, k_pe, table, seqlens)
     torch.npu.synchronize()
     print(f"PROF paged block_size={bs} block_N={args.block_n} ns={args.num_split} "
-          f"o_partial_absmax={op.abs().max().item():.3f}")
+          f"dual_schedule={dual} o_partial_absmax={op.abs().max().item():.3f}")
 
 
 if __name__ == "__main__":

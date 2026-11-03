@@ -139,6 +139,7 @@ def mla_decode_paged_fwd(
     vector_mode="simd_rc",
     stage_cols=None,
     pv_l0=False,
+    pair_stages=1,
 ):
     """Phase 1: per-split partial output + log-sum-exp over a paged KV cache.
 

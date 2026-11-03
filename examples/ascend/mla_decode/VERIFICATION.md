@@ -226,6 +226,13 @@ vector pipe is now the longest and a perfectly overlapped kernel would reach
 1.49 us/tile (cube ceiling ~89%); the measured wall is 2.64 us/tile, so the
 remaining gap is dependency-chain overlap. Reaching 90% cube utilisation still
 needs cross-iteration multi-buffering (or a manually scheduled mixed kernel).
+Forcing the buffering from the kernel is not a workaround: pinning `s_ub`/`p_ub`
+to two versions makes the compiler emit a silently wrong kernel (0.2 ms, zero or
+garbage output, verified with fresh data), and `pair_stages=2` alone moves <1%.
+Three tile slots, the fused softmax, `vector_mode="simt"` and block_N=128 were all
+measured slower, so the 90% target is closed on this compiler: the kernel-side
+work (automatic split sizing, single KV read, the two-tile schedule) is at its
+measured optimum.
 
 `compile_mla_decode_paged(pv_l0=True)` now selects `target="pto"` for both phases
 internally, so callers do not have to set the environment; the default
@@ -326,6 +333,7 @@ no tier is bandwidth limited.
 | merge `tmp` x4 versions on the paged (fp32-partial) merge | e2e 56.85 -> 56.92 us, phase 1 49.11 -> 49.05 us: no effect | closed |
 | page 128 | identical to page 64 in both schedules | closed |
 | fused softmax (scale/mask folded into the row-max reducer, score tile read-only) | semi-fused: e2e 6.77 vs 5.82 ms at batch=64/kv=32768 (+16%) and 1.88 vs 1.59 ms at kv=8192; a reducer over a select/multiply expression lowers to a scalar pass. The fully-fused variant additionally needs +16 KiB UB (224512 > 221184) | closed |
+| forcing `s_ub`/`p_ub` to 2 versions (`annotate_buffer_versions`, `pair_stages` 1 or 2) | the compiler reports success and the kernel runs in 0.19-0.30 ms, but the output is silently wrong: fresh data gives rel=1.000 (all zeros) at batch=64 and rel=206 at batch=8, while `pair_stages`/versions 0 is correct at 5.28 ms. Removed; the auto-scheduler's own versioning is the only safe path | closed |
 | PV as `P @ K` on L0 operands (single KV read, `transpose_B=False`) | **AscendC backend**: compiles but the AI core faults (device error 507015) -- the K tile is K-major for QK and MN-major for the NN PV operand and the L1->L0B copy cannot convert majors. **PTO backend** (`target="pto"`): works and is the current best single-read path (see below) | open (PTO-only) |
 | three KV tiles in flight (`TILE_SLOTS=3`) | phase 1 50.9 vs 43.6 us, e2e 58.7 vs 52.6 us; L1 at ~496 KiB leaves the scheduler no room | closed |
 | V^T double-buffered and prefetched in the copy phase | phase 1 45.1 vs 43.6 us, e2e 52.9 vs 52.6 us (same run) | closed |

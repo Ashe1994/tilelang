@@ -265,7 +265,13 @@ vec ~1.49 us and fixpipe 0.98 us, i.e. the vector pipe is now the longest and a
 perfectly overlapped kernel would reach 1.49 us/tile (cube ceiling ~89%). The
 measured wall is 2.64 us/tile, so the remaining gap is the dependency chain the
 auto-scheduler does not overlap -- the utilisation target is blocked by
-cross-iteration multi-buffering, not by traffic any more.
+cross-iteration multi-buffering, not by traffic any more. Forcing that buffering
+from the kernel is not a workaround: pinning the score/p tiles to two versions
+makes the compiler emit a silently wrong kernel (0.2 ms, zero/garbage output,
+verified with fresh data), `pair_stages=2` alone moves less than 1%, and three
+tile slots, the fused softmax, `vector_mode="simt"` and block_N=128 all measured
+slower. The kernel-side work (automatic split sizing, single KV read, the two-tile
+schedule) is at its measured optimum on this compiler.
 
 ## Profile (msprof)
 

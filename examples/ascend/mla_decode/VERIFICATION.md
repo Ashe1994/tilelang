@@ -164,13 +164,35 @@ layer should size it from the max live length instead of the fixed default 16.
 ### Automatic split sizing and the converged cube-bound target
 
 `compile_mla_decode_paged(num_split=None)` derives the split count with
-`pick_num_split`: about 16 KV tiles per split, at least `16 / batch` splits and at
-most 8 per batch element. That reproduces the measured optima (batch=1: 16
-everywhere; batch=64: 1/2/4/8/8/8 for kv=1024..32768) and is covered by
-`test_pick_num_split` plus `test_paged_auto_split` (28/28 tests pass). The batch=64
-sweep with the automatic count: 0.29 / 0.46 / 0.85 / 1.65 / 3.03 / 5.86 ms for
-kv=1024..32768 against 0.85 / 0.97 / 1.27 / 1.88 / 3.19 / 5.85 ms with the old
-fixed 16 -- a 2.9x win at kv=1024 and no regression at the top end.
+`pick_num_split`: about **32 KV tiles per split** (16 on the shortest lengths), at
+least two splits per batch element, at least `16 / batch` splits, at most 8 per
+batch element. Batch=1 keeps 16 everywhere; batch=64 gets 2/2/2/4/8/8.
+
+The denser sweep (batch=64, DT host, 2 rounds median) that set the rule:
+
+| kv_len | best num_split | e2e | TFLOPS | previous rule / its e2e |
+|---:|---:|---:|---:|---|
+| 1024 | 2 (1 ties) | 0.277 ms | 66.0 | 1 / 0.29 ms |
+| 2048 | 2 | 0.440 ms | 82.9 | 2 / 0.44 ms |
+| 4096 | **2** | 0.768 ms | 95.1 | 4 / 0.833 ms (-8%) |
+| 8192 | **4** | 1.496 ms | 97.6 | 8 / 1.560 ms (-4%) |
+| 16384 | 8 | 2.815 ms | 103.7 | 8 / 2.82 ms |
+| 32768 | 8 | 5.312 ms | 110.0 | 8 / 5.31 ms |
+
+The automatic path reproduces these numbers (6/6 shapes correct, rel 3.9e-4 ..
+6.3e-4) and the fixed-16 comparison is 0.85 / 0.97 / 1.27 / 1.88 / 3.19 / 5.85 ms
+-- 2.9x at kv=1024 and 4-8% at kv=4096/8192 from the new rule.
+
+Three more candidates measured as no-ops at batch=64 (DT host) and therefore not
+adopted:
+
+* L2 cache-policy hints: 1.556 vs 1.559 ms (kv=8192) and 5.340 vs 5.337 ms
+  (kv=32768), i.e. 0.2% / 0.0%;
+* page-table locality (identity vs random permutation): 0% at kv=8192, and the
+  random table was 1.9% faster at kv=32768 (noise). With `block_size == block_N`
+  a tile is exactly one page, so the mapping cannot change locality;
+* fp16 `O_partial` at the new split counts: 5.317 vs 5.313 ms (kv=32768) and
+  2.827 vs 2.815 ms (kv=16384).
 
 `msprof` at batch=64 (`bench/prof_multi.py --variant paged`) gives the per-tile
 budget that bounds the utilisation target (AscendC, shipped path):

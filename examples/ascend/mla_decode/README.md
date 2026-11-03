@@ -218,14 +218,15 @@ What it shows:
 | 32768 | 8 | 5.79 ms | 100.9 | 788 | 3.2x |
 
 `compile_mla_decode_paged(num_split=None)` now sizes this automatically with
-`pick_num_split(max_pages * block_size, block_N, batch)`: about 16 KV tiles per
-split, at least `16 / batch` splits (so a single request still fills the machine)
-and at most 8 splits per batch element (beyond that the extra partial traffic buys
-nothing). The resulting table is 16/16/16/16/16/16 for batch=1 and
-1/2/4/8/8/8 for batch=64, which matches the measured optima, so a serving layer
-gets the short-KV win without passing anything: batch=64 / kv=1024 measures
-0.29 ms (2.2x native) instead of 0.85 ms with the old fixed 16, and kv=8192
-1.65 ms instead of 1.88 ms.
+`pick_num_split(max_pages * block_size, block_N, batch)`: about **32 KV tiles per
+split** (16 on the shortest lengths), at least two splits per batch element, at
+least `16 / batch` splits (so a single request still fills the machine) and at
+most 8 per batch element (beyond that the partial traffic buys nothing). The
+resulting table is 16/16/16/16/16/16 for batch=1 and **2/2/2/4/8/8** for
+batch=64, which is the measured optimum (the denser sweep at batch=64 showed
+NS=2/4/8 beating NS=4/8/16 at kv=4096/8192 by 8%/4%). batch=64 / kv=1024 measures
+0.28-0.29 ms (2.2x native) instead of 0.85 ms with the fixed 16, kv=8192 1.50 ms
+instead of 1.88 ms, and kv=32768 5.31 ms instead of 5.85 ms.
 
 ### Converged evaluation: cube-bound at ~50% of the cube peak
 
@@ -257,6 +258,23 @@ K-major/MN-major layout mismatch). On the PTO backend it worked and measured
 5.47 vs 5.86 ms at batch=64 / kv=32768, but PTO is not used, so the parameter and
 its `target="pto"` selection were removed; the numbers are kept in
 `VERIFICATION.md`.
+
+### Verified as no-ops (batch=64)
+
+Three further candidates were measured on the batch=64 harness and made no
+difference, so they are not in the kernel:
+
+* **L2 cache-policy hints** (`l2_cache_ctrl` on the transposed V read and on the
+  partial/ML stores): 1.556 vs 1.559 ms at kv=8192 and 5.340 vs 5.337 ms at
+  kv=32768 -- 0.2% and 0.0%. The parameter was removed again;
+* **page-table locality** (identity table vs a random page permutation): 0% at
+  kv=8192 and 1.9% *faster* for the random table at kv=32768, i.e. noise. With
+  `block_size == block_N == 64` every tile is exactly one page, so a tile read is
+  contiguous regardless of the table mapping -- table locality only matters when
+  `block_size < block_N`;
+* **fp16 `O_partial`** at the new split counts: 5.317 vs 5.313 ms at kv=32768 and
+  2.827 vs 2.815 ms at kv=16384 (0.1-0.4%, slightly slower), matching the earlier
+  batch=1 result.
 
 ## Profile (msprof)
 

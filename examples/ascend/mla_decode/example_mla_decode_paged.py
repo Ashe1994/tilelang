@@ -102,11 +102,12 @@ def pick_num_split(kv_len, block_N, batch, num_cores=16, max_split=16):
     the previous fixed behaviour.
     """
     kv_tiles = max(1, (kv_len + block_N - 1) // block_N)
-    # Eight splits is the measured cap per batch element: beyond it the partial
-    # traffic doubles for no latency gain (batch=64: kv=16384/32768 prefer 8 over
-    # 16 by 1-8%), while a single batch element still needs 16 splits to fill the
-    # machine.
-    by_work = max(1, min(8, kv_tiles // 16))
+    # Measured optimum at batch=64: about 32 KV tiles per split (16 on the
+    # shortest lengths, where the per-block latency dominates), at least two
+    # splits per batch element and at most eight -- beyond eight the extra partial
+    # traffic buys nothing. Measured tiles/split: kv=4096/8192/16384 prefer
+    # NS=2/4/8 over NS=4/8/16 by 4-8%; kv=32768 is flat between 8 and 16.
+    by_work = min(8, max(2, kv_tiles // 32))
     by_parallel = max(1, (num_cores + max(1, batch) - 1) // max(1, batch))
     return max(1, min(kv_tiles, max_split, max(by_work, by_parallel)))
 

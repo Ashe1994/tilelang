@@ -196,13 +196,31 @@ The measured block wall is 2.55 us/tile (kv=32768: 163 us per 64-tile block,
   a transposed L1 operand), (2) vector-pass reduction so the vector pipe stops
   being the second-longest, (3) more tiles in flight per core.
 
-Both near-term attempts were made and rejected (dead-end table): the fused
-softmax pass is 16-18% slower because a reducer over a select/multiply expression
-lowers to a scalar pass (and the fully fused variant adds 16 KiB of UB), and the
-single-read `P @ K` L0 GEMM compiles but faults the AI core at run time because
-the K tile cannot be both K-major (QK) and MN-major (NN PV) for the same L1 copy.
-Reaching 90% cube utilisation therefore needs the two compiler features above,
-not another kernel rearrangement.
+The fused-softmax attempt is 16-18% slower because a reducer over a
+select/multiply expression lowers to a scalar pass (and the fully fused variant
+adds 16 KiB of UB), so vector-pass fusion is closed.
+
+The single-read `P @ K` L0 GEMM is the one that worked, but only on the **PTO
+backend** (`pv_l0=True`, `target="pto"`): the AscendC L0 path faults on the
+K-major/MN-major layout mismatch, while PTO supports the L0 operand shapes we
+need. Measured at batch=64 with `num_split=8` (event timing, 2 rounds):
+
+| case | staged V^T (ascend) | single read (pto + pv_l0) | delta |
+|---|---:|---:|---:|
+| kv=8192 | 1.65 ms | **1.57 ms** | -4.8% |
+| kv=32768 | 5.86 ms | **5.57 ms** | -5.0% |
+
+MTE2 traffic per tile drops from 136 KB (K + transposed V) to 72 KB (K only) by
+construction, and the relative error is unchanged (6.6e-4 / 6.3e-4). Three tile
+slots on top of the single read were measured too and are slower (5.81 ms), so
+the two-slot schedule stays. `msprof op` cannot profile PTO kernels in this
+environment ("profiling results are empty"), so the pipe-level split of the PTO
+build is not captured yet; the PTO-only path is exposed as an opt-in flag and the
+default stays on the AscendC backend.
+
+Reaching 90% cube utilisation still needs cross-iteration multi-buffering (or a
+manually scheduled mixed kernel), and the single-read path needs PTO as the
+deployment backend.
 
 ## 5. Two-tile CV-overlap schedule (phase 1)
 
@@ -294,7 +312,7 @@ no tier is bandwidth limited.
 | merge `tmp` x4 versions on the paged (fp32-partial) merge | e2e 56.85 -> 56.92 us, phase 1 49.11 -> 49.05 us: no effect | closed |
 | page 128 | identical to page 64 in both schedules | closed |
 | fused softmax (scale/mask folded into the row-max reducer, score tile read-only) | semi-fused: e2e 6.77 vs 5.82 ms at batch=64/kv=32768 (+16%) and 1.88 vs 1.59 ms at kv=8192; a reducer over a select/multiply expression lowers to a scalar pass. The fully-fused variant additionally needs +16 KiB UB (224512 > 221184) | closed |
-| PV as `P @ K` on L0 operands (single KV read, `transpose_B=False`) | compiles, but the AI core faults at run time (device error 507015): the K tile is K-major for the QK operand and MN-major for the NN PV operand, and the L1->L0B copy cannot convert majors. Needs a transposed L1->L0B load in the compiler | closed |
+| PV as `P @ K` on L0 operands (single KV read, `transpose_B=False`) | **AscendC backend**: compiles but the AI core faults (device error 507015) -- the K tile is K-major for QK and MN-major for the NN PV operand and the L1->L0B copy cannot convert majors. **PTO backend** (`target="pto"`): works and is the current best single-read path (see below) | open (PTO-only) |
 | three KV tiles in flight (`TILE_SLOTS=3`) | phase 1 50.9 vs 43.6 us, e2e 58.7 vs 52.6 us; L1 at ~496 KiB leaves the scheduler no room | closed |
 | V^T double-buffered and prefetched in the copy phase | phase 1 45.1 vs 43.6 us, e2e 52.9 vs 52.6 us (same run) | closed |
 | reorder: slot-0 PV placed between the two softmax passes | e2e 56.8 vs 53.6 us (same run); the scheduler prefers the batched phases | closed |

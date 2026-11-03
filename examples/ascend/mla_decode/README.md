@@ -251,9 +251,15 @@ dead-end table): folding the softmax scale/mask pass into the row-max reducer is
 pass, and the fully fused variant needs +16 KiB of UB), and computing PV as
 `P @ K` on L0 operands -- the single-read path -- compiles but faults the AI core
 because the K tile is K-major for the QK operand and MN-major for the NN PV
-operand, which the L1->L0B copy cannot convert. Both are compiler-side items now,
-so the utilisation target stays blocked by: (a) a transposed L1->L0B load (single
-KV read), (b) cross-iteration multi-buffering for near-perfect CV overlap.
+operand, which the L1->L0B copy cannot convert. The single-read path did land on the **PTO
+backend**: `compile_mla_decode_paged(pv_l0=True)` with `target="pto"` computes PV
+as `P @ K` on L0 operands, so the KV tensor is read once (72 KB/tile instead of
+136 KB) and the measured batch=64 numbers improve by 5% (kv=8192: 1.65 -> 1.57 ms,
+kv=32768: 5.86 -> 5.57 ms, relative error unchanged). The AscendC backend faults
+on the same program, and `msprof` cannot profile PTO kernels here, so `pv_l0`
+stays opt-in and the default remains AscendC. The utilisation target is still
+blocked by (a) cross-iteration multi-buffering for near-perfect CV overlap and
+(b) PTO as the deployment backend (plus pipe-level profiling for it).
 
 ## Profile (msprof)
 

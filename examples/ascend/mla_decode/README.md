@@ -227,51 +227,36 @@ gets the short-KV win without passing anything: batch=64 / kv=1024 measures
 0.29 ms (2.2x native) instead of 0.85 ms with the old fixed 16, and kv=8192
 1.65 ms instead of 1.88 ms.
 
-### Where the 90% utilisation target stands
+### Converged evaluation: cube-bound at ~50% of the cube peak
 
-Per KV tile (block_N=64) the pipes need `cube 1.32 us`, `mte2 1.68 us`,
-`vec ~1.49 us` per AIV and `fixpipe 0.98 us`. The measured block wall is
-2.55 us/tile at batch=64 / kv=32768, so the pipes overlap only partially and even
-a perfect overlap would stop at `max(...) = 1.68 us` -- **cube utilisation is
-capped near 79% by MTE2, not by the cube**. The cause is the double KV read
-(K for QK + transposed V for PV = 136 KB/tile against 72 KB for a single read),
-which the NT-only L1 GEMM forces. Cutting MTE2 to one read (0.89 us/tile) puts the
-cube at `1.32 / 0.9 = 1.47 us` of wall, the first configuration where 90% cube
-utilisation is reachable -- provided the cube/vector overlap is also perfect,
-which the auto-scheduler does not deliver today.
+The **AscendC backend is the shipped path**; the PTO single-read experiment is
+archived (below) and its code removed. Per KV tile (block_N=64) the pipes need
+`cube 1.32 us`, `mte2 1.68 us`, `vec ~1.49 us` per AIV and `fixpipe 0.98 us`,
+against a measured block wall of 2.55 us/tile at batch=64 / kv=32768:
 
-Cube and GM cannot both approach 90% on this workload: at 90% cube the kernel runs
-~3.0 ms for batch=64 / kv=32768 and moves ~2.4 GB, i.e. ~790 GB/s (20% of the GM
-peak); saturating the GM peak would need ~890 TFLOPS, twice the fp16 peak. The
-realistic target is cube-bound at 90% with ~40% GM.
+* cube busy is ~52% of the wall (84.4 us of cube per 163 us block) and 23-24% of
+  the cube peak in TFLOPS terms (100.9 of 432 TFLOPS at kv=32768 with the
+  automatic split count);
+* the perfect-overlap floor is `max(cube, mte2, vec) = 1.68 us/tile`, so cube
+  utilisation is capped near 79% by MTE2 (K + transposed V = 136 KB/tile against
+  72 KB for a single read), not by the cube;
+* cube and GM cannot both be 90%: at 90% cube the kernel would move ~2.4 GB in
+  ~3.0 ms (~790 GB/s, 20% of the GM peak); saturating 3.6 TB/s needs ~890 TFLOPS,
+  twice the fp16 peak.
 
-Two structural attempts toward that target were measured and rejected (see the
-dead-end table): folding the softmax scale/mask pass into the row-max reducer is
-16-18% slower (a reducer over a select/multiply expression lowers to a scalar
-pass, and the fully fused variant needs +16 KiB of UB), and computing PV as
-`P @ K` on L0 operands -- the single-read path -- compiles but faults the AI core
-because the K tile is K-major for the QK operand and MN-major for the NN PV
-operand, which the L1->L0B copy cannot convert. The single-read path did land on the **PTO
-backend**: `compile_mla_decode_paged(pv_l0=True)` computes PV as `P @ K` on L0
-operands (the compile entry selects `target="pto"` automatically for it), so the
-KV tensor is read once -- 72 KB/tile instead of 136 KB -- and the batch=64 numbers
-improve by 5% (kv=8192: 1.65 -> 1.56 ms, kv=32768: 5.86 -> 5.47 ms with
-`pair_stages=2`, relative error unchanged). The AscendC backend faults on the same
-program, and `msprof` cannot profile PTO kernels here, so `pv_l0` stays opt-in and
-the default remains AscendC.
+Every kernel-side lever was measured (dead-end table): larger block_N, three tile
+slots, fused softmax, `vector_mode="simt"`, fp16 partials, forced buffer versions
+and `pair_stages=2`; none moved the numbers in the right direction. The remaining
+1.5x to the 1.68 us/tile floor is the phase-1 dependency chain that the
+auto-scheduler does not overlap, and closing it needs compiler support. The
+delivered kernel therefore targets **cube-bound at ~50%** as the measured optimum.
 
-With the single read the per-tile pipe budget becomes cube 1.32 us, mte2 0.89 us,
-vec ~1.49 us and fixpipe 0.98 us, i.e. the vector pipe is now the longest and a
-perfectly overlapped kernel would reach 1.49 us/tile (cube ceiling ~89%). The
-measured wall is 2.64 us/tile, so the remaining gap is the dependency chain the
-auto-scheduler does not overlap -- the utilisation target is blocked by
-cross-iteration multi-buffering, not by traffic any more. Forcing that buffering
-from the kernel is not a workaround: pinning the score/p tiles to two versions
-makes the compiler emit a silently wrong kernel (0.2 ms, zero/garbage output,
-verified with fresh data), `pair_stages=2` alone moves less than 1%, and three
-tile slots, the fused softmax, `vector_mode="simt"` and block_N=128 all measured
-slower. The kernel-side work (automatic split sizing, single KV read, the two-tile
-schedule) is at its measured optimum on this compiler.
+Archived experiment (not shipped): a single-KV-read PV (`P @ K` on L0 operands,
+`transpose_B=False`) is unusable on AscendC (AI-core fault from the
+K-major/MN-major layout mismatch). On the PTO backend it worked and measured
+5.47 vs 5.86 ms at batch=64 / kv=32768, but PTO is not used, so the parameter and
+its `target="pto"` selection were removed; the numbers are kept in
+`VERIFICATION.md`.
 
 ## Profile (msprof)
 

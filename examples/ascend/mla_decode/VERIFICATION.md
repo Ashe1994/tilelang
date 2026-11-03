@@ -161,9 +161,9 @@ against the measured 1/2/4/8/8/8 best points (within 8% at the two largest
 lengths). Callers pass `num_split` to `compile_mla_decode_paged`, so a serving
 layer should size it from the max live length instead of the fixed default 16.
 
-### Automatic split sizing and the 90% utilisation target
+### Automatic split sizing and the converged cube-bound target
 
-`compile_mla_decode_paged(num_split=None)` now derives the split count with
+`compile_mla_decode_paged(num_split=None)` derives the split count with
 `pick_num_split`: about 16 KV tiles per split, at least `16 / batch` splits and at
 most 8 per batch element. That reproduces the measured optima (batch=1: 16
 everywhere; batch=64: 1/2/4/8/8/8 for kv=1024..32768) and is covered by
@@ -173,7 +173,7 @@ kv=1024..32768 against 0.85 / 0.97 / 1.27 / 1.88 / 3.19 / 5.85 ms with the old
 fixed 16 -- a 2.9x win at kv=1024 and no regression at the top end.
 
 `msprof` at batch=64 (`bench/prof_multi.py --variant paged`) gives the per-tile
-budget that bounds the utilisation target:
+budget that bounds the utilisation target (AscendC, shipped path):
 
 | pipe | per tile | note |
 |---|---:|---|
@@ -182,66 +182,25 @@ budget that bounds the utilisation target:
 | AIV vec | ~1.49 us per AIV | softmax 4 passes + PV rescale |
 | AIC fixpipe | 0.98 us | |
 
-The measured block wall is 2.55 us/tile (kv=32768: 163 us per 64-tile block,
-512 blocks), so the pipes overlap partially and the perfect-overlap floor is
-`max = 1.68 us`. Consequences:
+The measured block wall is 2.55 us/tile (kv=32768: 163 us per 64-tile block, 512
+blocks), i.e. **cube busy ~52% of the wall / 23-24% of the cube peak**, and the
+perfect-overlap floor is `max = 1.68 us`:
 
-* **cube busy cannot exceed ~79%** with the current traffic, because MTE2 is the
-  longest pipe; raising it needs the KV single read (0.89 us/tile), which the
-  NT-only L1 GEMM blocks (section 8);
-* **cube and GM cannot both be 90%**: at 90% cube the kernel would move ~2.4 GB in
-  ~3.0 ms (~790 GB/s, 20% of peak); saturating 3.6 TB/s would need ~890 TFLOPS,
-  twice the fp16 peak. The realistic target is cube-bound at 90% with ~40% GM;
-* the concrete order of work is therefore (1) KV single read (compiler support for
-  a transposed L1 operand), (2) vector-pass reduction so the vector pipe stops
-  being the second-longest, (3) more tiles in flight per core.
+* cube utilisation is capped near 79% by MTE2 (the double KV read), not by the
+  cube;
+* cube and GM cannot both be 90%: at 90% cube the kernel would move ~2.4 GB in
+  ~3.0 ms (~790 GB/s, 20% of the GM peak), while saturating 3.6 TB/s needs
+  ~890 TFLOPS, twice the fp16 peak;
+* every kernel-side lever was measured and rejected (dead-end table), so the
+  remaining 1.5x to the floor is the dependency chain the auto-scheduler does not
+  overlap and needs compiler support. The delivered target is therefore
+  **cube-bound at ~50%**, which is what the shipped kernel measures.
 
-The fused-softmax attempt is 16-18% slower because a reducer over a
-select/multiply expression lowers to a scalar pass (and the fully fused variant
-adds 16 KiB of UB), so vector-pass fusion is closed.
-
-The single-read `P @ K` L0 GEMM is the one that worked, but only on the **PTO
-backend** (`pv_l0=True`, `target="pto"`): the AscendC L0 path faults on the
-K-major/MN-major layout mismatch, while PTO supports the L0 operand shapes we
-need. Measured at batch=64 with `num_split=8` (event timing, 2 rounds):
-
-| case | staged V^T (ascend) | single read (pto + pv_l0) | delta |
-|---|---:|---:|---:|
-| kv=8192 | 1.65 ms | **1.56 ms** | -5.5% |
-| kv=32768 | 5.86 ms | **5.47 ms** | -6.7% |
-
-MTE2 traffic per tile drops from 136 KB (K + transposed V) to 72 KB (K only) by
-construction, and the relative error is unchanged (6.6e-4 / 6.3e-4). Three tile
-slots on top of the single read were measured too and are slower (5.81 ms), so
-the two-slot schedule stays. `msprof op` cannot profile PTO kernels in this
-environment ("profiling results are empty"), so the pipe-level split of the PTO
-build is not captured yet; the PTO-only path is exposed as an opt-in flag and the
-default stays on the AscendC backend.
-
-`pair_stages=2` (cross-iteration pipelining of the pair loop) was measured on top
-of the single read: kv=32768 5.47 vs 5.52 ms (-0.9%), kv=8192 neutral, so the
-auto-scheduler gains little from the extra buffering. With the single read the
-per-tile budget is cube 1.32 / mte2 0.89 / vec ~1.49 / fixpipe 0.98 us, i.e. the
-vector pipe is now the longest and a perfectly overlapped kernel would reach
-1.49 us/tile (cube ceiling ~89%); the measured wall is 2.64 us/tile, so the
-remaining gap is dependency-chain overlap. Reaching 90% cube utilisation still
-needs cross-iteration multi-buffering (or a manually scheduled mixed kernel).
-Forcing the buffering from the kernel is not a workaround: pinning `s_ub`/`p_ub`
-to two versions makes the compiler emit a silently wrong kernel (0.2 ms, zero or
-garbage output, verified with fresh data), and `pair_stages=2` alone moves <1%.
-Three tile slots, the fused softmax, `vector_mode="simt"` and block_N=128 were all
-measured slower, so the 90% target is closed on this compiler: the kernel-side
-work (automatic split sizing, single KV read, the two-tile schedule) is at its
-measured optimum.
-
-`compile_mla_decode_paged(pv_l0=True)` now selects `target="pto"` for both phases
-internally, so callers do not have to set the environment; the default
-(`pv_l0=False`) stays on the AscendC backend. The single-read build was validated
-on five representative paged shapes under PTO (short sequence, `num_split=1`,
-batch=4 mixed lengths, batch=2 `num_split=32` with empty splits, and the
-block-table honouring test): 5/5 pass. `vector_mode="simt"` on the single-read
-build is still much slower than the SIMD rescale (kv=32768: 10.42 vs 5.48 ms), so
-`simd_rc` stays.
+Archived (removed from the code): the single-read PV path. `P @ K` on L0 operands
+with `transpose_B=False` faults the AI core on AscendC (K-major vs MN-major
+layout), and although the PTO backend ran it correctly at 5.47 vs 5.86 ms
+(batch=64, kv=32768), PTO is not used, so `pv_l0`, `pair_stages` and the automatic
+`target="pto"` selection were removed. The measurements stay here for reference.
 
 ## 5. Two-tile CV-overlap schedule (phase 1)
 
@@ -334,7 +293,7 @@ no tier is bandwidth limited.
 | page 128 | identical to page 64 in both schedules | closed |
 | fused softmax (scale/mask folded into the row-max reducer, score tile read-only) | semi-fused: e2e 6.77 vs 5.82 ms at batch=64/kv=32768 (+16%) and 1.88 vs 1.59 ms at kv=8192; a reducer over a select/multiply expression lowers to a scalar pass. The fully-fused variant additionally needs +16 KiB UB (224512 > 221184) | closed |
 | forcing `s_ub`/`p_ub` to 2 versions (`annotate_buffer_versions`, `pair_stages` 1 or 2) | the compiler reports success and the kernel runs in 0.19-0.30 ms, but the output is silently wrong: fresh data gives rel=1.000 (all zeros) at batch=64 and rel=206 at batch=8, while `pair_stages`/versions 0 is correct at 5.28 ms. Removed; the auto-scheduler's own versioning is the only safe path | closed |
-| PV as `P @ K` on L0 operands (single KV read, `transpose_B=False`) | **AscendC backend**: compiles but the AI core faults (device error 507015) -- the K tile is K-major for QK and MN-major for the NN PV operand and the L1->L0B copy cannot convert majors. **PTO backend** (`target="pto"`): works and is the current best single-read path (see below) | open (PTO-only) |
+| PV as `P @ K` on L0 operands (single KV read, `transpose_B=False`) | **AscendC backend**: compiles but the AI core faults (device error 507015) -- the K tile is K-major for QK and MN-major for the NN PV operand and the L1->L0B copy cannot convert majors. **PTO backend**: ran correctly and was faster (5.47 vs 5.86 ms at batch=64/kv=32768), but PTO is not used -- the parameter, the `pair_stages` knob and the automatic `target="pto"` selection were **removed from the code**; the numbers are kept here for reference | archived |
 | three KV tiles in flight (`TILE_SLOTS=3`) | phase 1 50.9 vs 43.6 us, e2e 58.7 vs 52.6 us; L1 at ~496 KiB leaves the scheduler no room | closed |
 | V^T double-buffered and prefetched in the copy phase | phase 1 45.1 vs 43.6 us, e2e 52.9 vs 52.6 us (same run) | closed |
 | reorder: slot-0 PV placed between the two softmax passes | e2e 56.8 vs 53.6 us (same run); the scheduler prefers the batched phases | closed |
@@ -400,31 +359,33 @@ the benchmark would run.
 
 1. **Cube/Vector overlap, part 2** - the two-tile schedule overlaps QK with the
    other tile's softmax. Pushing further is *not* reachable by rearranging this
-   kernel: three slots, V^T double buffering, PV/softmax reordering and a deeper
-   pair loop all measured slower or neutral (section 8), so the batched-phase
-   two-tile schedule is a local optimum for this auto-scheduler. The next step
-   would be a hand-written `T.MixedKernel` with explicit `T.Cube()` /
-   `T.Vector()` regions and manual flags, or compiler support for cross-iteration
-   multi-buffering.
-2. **split-count sizing for serving** - the batch=64 sweep (section 4) shows the
-   optimal `num_split` follows the KV length (`clamp(kv_tiles / 16, 1, 16)`), and
-   a fixed 16 costs 2.9x at kv=1024 (0.85 -> 0.29 ms). A serving layer should pick
-   it from the max live length; the same plan is what the packed split idea below
-   generalises to uneven batches.
-4. **packed length-proportional split plan** - keep the paged grid (and its
+   kernel: three slots, V^T double buffering, PV/softmax reordering, a deeper pair
+   loop, fused softmax and forced buffer versions all measured slower, neutral or
+   silently wrong (section 8), so the batched-phase two-tile schedule is a local
+   optimum for this auto-scheduler. Closing the remaining 1.5x to the 1.68 us/tile
+   floor needs compiler support: cross-iteration multi-buffering, or a working
+   manual mixed-kernel mode.
+2. **packed length-proportional split plan** - keep the paged grid (and its
    cross-block overlap) but balance the KV tiles per block from a global plan;
    this is the follow-up to the persistent probe (section 4), where balance won
    1.35x on a ragged batch but the one-block-per-core grid lost 0.72-0.89x on
    uniform multi-batch work.
 3. **paged full-SIMD vector modes** (`simd` / `simd_exp`) are not implemented in
    this kernel; the earlier fp32-partial build measured `simd_exp` at +56%.
-3. **KV single read** remains blocked by the NT-only L1 GEMM and the layout
-   inference conflict (see section 8).
+4. **KV single read on the shipped backend** - the PTO-based `P @ K` L0 path was
+   measured (5.47 vs 5.86 ms at batch=64/kv=32768) and then removed with the PTO
+   decision; doing it on AscendC needs a transposed L1->L0B load from the
+   compiler.
+5. **split-count sizing** is automatic now (`pick_num_split`, section 4); a
+   serving layer only has to leave `num_split=None` (the default).
 
 ## 12. History
 
 The directory was slimmed to the native reference + the paged kernel (with its
-tests, two benchmark entries, the profile summariser, this report and the
-README). The paged phase-1 kernel then gained the two-tile CV-overlap schedule
-(-7.6% end-to-end); everything else is unchanged from the earlier full-tree
-verification.
+tests, benchmark entries, the profile summariser, this report and the README). The
+paged phase-1 kernel then gained the two-tile CV-overlap schedule (-7.6%
+end-to-end), automatic split sizing (2.9x at batch=64/kv=1024) and the
+persistent/ragged-batch variant. The 90% utilisation target was closed as
+cube-bound at ~50% of the cube peak after every kernel-side lever was measured
+(section 8); the PTO single-read experiment was archived with the decision not to
+ship the PTO backend.

@@ -138,8 +138,6 @@ def mla_decode_paged_fwd(
     partial_dtype="float32",
     vector_mode="simd_rc",
     stage_cols=None,
-    pv_l0=False,
-    pair_stages=1,
 ):
     """Phase 1: per-split partial output + log-sum-exp over a paged KV cache.
 
@@ -458,8 +456,6 @@ def mla_decode_paged_fwd_dual(
     partial_dtype="float32",
     vector_mode="simd_rc",
     stage_cols=None,
-    pv_l0=False,
-    pair_stages=1,
 ):
     """Phase 1: per-split partial output + log-sum-exp over a paged KV cache.
 
@@ -567,17 +563,10 @@ def mla_decode_paged_fwd_dual(
                 [T.alloc_l1((block_H, PAGE_ROWS), dtype) for _ in range(NUM_PC)]
                 for _ in range(TILE_SLOTS)
             ]
-            if pv_l0:
-                # PV as P @ K on L0 operands: the K tile is reused in its natural
-                # layout (trans_B=False), so no transposed V copy is needed and the
-                # KV tensor is read once per tile.
-                p_l0a = T.alloc_l0a((block_H, PAGE_ROWS), dtype)
-                b_l0b = T.alloc_l0b((PAGE_ROWS, chunk_d), dtype)
-            else:
-                v_l1 = [
-                    [T.alloc_l1((chunk_d, PAGE_ROWS), dtype) for _ in range(NUM_DC)]
-                    for _ in range(NUM_PC)
-                ]
+            v_l1 = [
+                [T.alloc_l1((chunk_d, PAGE_ROWS), dtype) for _ in range(NUM_DC)]
+                for _ in range(NUM_PC)
+            ]
 
             # ------------------------------ L0C -----------------------------
             s_l0c = [
@@ -630,7 +619,7 @@ def mla_decode_paged_fwd_dual(
             # Two KV tiles per iteration: K/K_pe of both slots are prefetched and
             # both QK GEMMs are issued, then slot 0's softmax runs while the cube
             # finishes slot 1's QK, then slot 1's softmax, then the two PV passes.
-            for pair in T.Pipelined(T.ceildiv(loop_range, TILE_SLOTS), num_stages=pair_stages):
+            for pair in T.Pipelined(T.ceildiv(loop_range, TILE_SLOTS), num_stages=1):
                 for ti, _t in enumerate(range(TILE_SLOTS)):
                     kv_blk = first + pair * TILE_SLOTS + ti
                     kv_blk_safe = T.min(kv_blk, first + loop_range - 1)
@@ -737,36 +726,26 @@ def mla_decode_paged_fwd_dual(
                 # PV for both slots; V^T is not double-buffered (it is only
                 # needed inside one slot's PV phase) to keep the L1 budget.
                 for ti, _t in enumerate(range(TILE_SLOTS)):
-                    if not pv_l0:
-                        kv_blk = first + pair * TILE_SLOTS + ti
-                        kv_blk_safe = T.min(kv_blk, first + loop_range - 1)
-                        pos = kv_blk_safe * block_N
-                        for pc, _vpc in enumerate(v_l1):
-                            p_pos = pos + pc * PAGE_ROWS
-                            page = block_table[b, T.min(p_pos // block_size, max_pages - 1)]
-                            kv_start = page * block_size + p_pos % block_size
-                            for i, vb in enumerate(v_l1[pc]):
-                                T.copy(
-                                    KV[
-                                        kv_start:kv_start + PAGE_ROWS,
-                                        i * chunk_d:(i + 1) * chunk_d,
-                                    ],
-                                    vb,
-                                    transpose=True,
-                                )
+                    kv_blk = first + pair * TILE_SLOTS + ti
+                    kv_blk_safe = T.min(kv_blk, first + loop_range - 1)
+                    pos = kv_blk_safe * block_N
+                    for pc, _vpc in enumerate(v_l1):
+                        p_pos = pos + pc * PAGE_ROWS
+                        page = block_table[b, T.min(p_pos // block_size, max_pages - 1)]
+                        kv_start = page * block_size + p_pos % block_size
+                        for i, vb in enumerate(v_l1[pc]):
+                            T.copy(
+                                KV[
+                                    kv_start:kv_start + PAGE_ROWS,
+                                    i * chunk_d:(i + 1) * chunk_d,
+                                ],
+                                vb,
+                                transpose=True,
+                            )
                     for i, _junk in enumerate(o_ub):
                         for pc, pb in enumerate(p_ub):
-                            if pv_l0:
-                                T.copy(p_l1[ti][pc][0:block_H, 0:PAGE_ROWS], p_l0a)
-                                T.copy(
-                                    k_l1[ti][pc][0:PAGE_ROWS, i * chunk_d:(i + 1) * chunk_d],
-                                    b_l0b,
-                                )
-                                T.gemm(p_l0a, b_l0b, o_l0c, transpose_B=False,
-                                       clear_accum=True)
-                            else:
-                                T.gemm(p_l1[ti][pc], v_l1[pc][i], o_l0c, transpose_B=True,
-                                       clear_accum=(pc == 0))
+                            T.gemm(p_l1[ti][pc], v_l1[pc][i], o_l0c, transpose_B=True,
+                                   clear_accum=(pc == 0))
                         T.dual_copy(o_l0c, o_tmp_ub[0:ROWS, 0:chunk_d])
                         if simd_rc:
                             with T.SimdVF():
@@ -1114,8 +1093,6 @@ def compile_mla_decode_paged(
     ml_width=ML_WIDTH_PAGED,
     merge_vector_mode="simd",
     stage_cols=None,
-    pv_l0=False,
-    pair_stages=1,
 ):
     """Compile phase 1 + the shared merge kernel, return one callable.
 
@@ -1124,12 +1101,6 @@ def compile_mla_decode_paged(
     ``vector_mode="simd_rc"``. The full-SIMD modes are rejected here on purpose:
     a per-page score tile is only 64 columns wide, so the explicit MicroAPI path
     measured no gain (phase 1 49.2 vs 49.1 us) and only adds UB pressure.
-
-    ``pv_l0=True`` computes PV as ``P @ K`` on L0 operands, so the KV tensor is
-    read once instead of twice (the K tile serves both GEMMs). It requires the PTO
-    backend (``target="pto"``): the AscendC L0 path faults at run time on the
-    K-major/MN-major layout mismatch. With PTO it measured 1.57 vs 1.65 ms at
-    batch=64 / kv=8192 and 5.57 vs 5.86 ms at kv=32768.
 
     ``num_split=None`` sizes the split count from ``max_pages * block_size`` and
     the batch with :func:`pick_num_split` (about 16 KV tiles per split, and at
@@ -1151,10 +1122,6 @@ def compile_mla_decode_paged(
     fwd, _dual = select_phase1_kernel(
         block_N, block_size, chunk_d, kv_hint=max_pages * block_size, num_split=num_split
     )
-
-    # pv_l0 (single KV read) needs the PTO backend: the AscendC L0 GEMM faults on
-    # the K-major/MN-major layout mismatch, so select the target with the flag.
-    backend = "pto" if pv_l0 else None
 
     partial = tilelang.compile(
         fwd(
@@ -1178,11 +1145,8 @@ def compile_mla_decode_paged(
             partial_dtype=partial_dtype,
             vector_mode=vector_mode,
             stage_cols=stage_cols,
-            pv_l0=pv_l0,
-            pair_stages=pair_stages,
         ),
         out_idx=[6, 7],
-        target=backend,
     )
     merge = tilelang.compile(
         mla_decode_merge(
@@ -1203,7 +1167,6 @@ def compile_mla_decode_paged(
             merge_vector_mode=merge_vector_mode,
         ),
         out_idx=[2],
-        target=backend,
     )
 
     def run(q, q_pe, kv, k_pe, block_table, cache_seqlens):

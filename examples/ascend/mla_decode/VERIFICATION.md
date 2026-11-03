@@ -229,7 +229,12 @@ needs cross-iteration multi-buffering (or a manually scheduled mixed kernel).
 
 `compile_mla_decode_paged(pv_l0=True)` now selects `target="pto"` for both phases
 internally, so callers do not have to set the environment; the default
-(`pv_l0=False`) stays on the AscendC backend.
+(`pv_l0=False`) stays on the AscendC backend. The single-read build was validated
+on five representative paged shapes under PTO (short sequence, `num_split=1`,
+batch=4 mixed lengths, batch=2 `num_split=32` with empty splits, and the
+block-table honouring test): 5/5 pass. `vector_mode="simt"` on the single-read
+build is still much slower than the SIMD rescale (kv=32768: 10.42 vs 5.48 ms), so
+`simd_rc` stays.
 
 ## 5. Two-tile CV-overlap schedule (phase 1)
 

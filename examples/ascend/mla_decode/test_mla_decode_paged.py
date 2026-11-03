@@ -248,7 +248,8 @@ def test_pick_num_split():
     assert pick_num_split(2048, 64, 64) == 2
     assert pick_num_split(4096, 64, 64) == 4
     assert pick_num_split(8192, 64, 64) == 8
-    assert pick_num_split(32768, 64, 64) == 16
+    assert pick_num_split(16384, 64, 64) == 8   # capped at 8 splits per batch
+    assert pick_num_split(32768, 64, 64) == 8
     assert pick_num_split(64, 64, 64) == 1         # never more splits than tiles
     assert pick_num_split(1024, 64, 4) == 4        # 16 cores / batch=4
 

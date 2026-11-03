@@ -245,6 +245,16 @@ Cube and GM cannot both approach 90% on this workload: at 90% cube the kernel ru
 peak); saturating the GM peak would need ~890 TFLOPS, twice the fp16 peak. The
 realistic target is cube-bound at 90% with ~40% GM.
 
+Two structural attempts toward that target were measured and rejected (see the
+dead-end table): folding the softmax scale/mask pass into the row-max reducer is
+16-18% slower (a reducer over a select/multiply expression lowers to a scalar
+pass, and the fully fused variant needs +16 KiB of UB), and computing PV as
+`P @ K` on L0 operands -- the single-read path -- compiles but faults the AI core
+because the K tile is K-major for the QK operand and MN-major for the NN PV
+operand, which the L1->L0B copy cannot convert. Both are compiler-side items now,
+so the utilisation target stays blocked by: (a) a transposed L1->L0B load (single
+KV read), (b) cross-iteration multi-buffering for near-perfect CV overlap.
+
 ## Profile (msprof)
 
 Captured with

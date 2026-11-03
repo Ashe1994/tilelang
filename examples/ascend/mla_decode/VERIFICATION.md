@@ -107,6 +107,60 @@ overlap) but choose each block's tile range from a global plan so every block
 owns the same number of KV tiles. That should keep the uniform-batch numbers and
 recover the ragged-batch win without the persistent item serialisation.
 
+### batch=64, float16 KV-length sweep
+
+`bench/bench_batch64.py` (same KV data for all three kernels: identity page table,
+so the dense native view and the paged view share one allocation; event timing,
+2 rounds, median, host load 100-120):
+
+| kv_len | tokens | native | paged (ns=16) | persistent (ns=16) | paged / native | paged TFLOPS | paged GB/s |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1024 | 65 536 | 0.63 ms | 0.85 ms | 1.23 ms | 0.74x | 21.4 | 168 |
+| 2048 | 131 072 | 1.20 ms | 0.97 ms | 1.24 ms | 1.24x | 37.8 | 295 |
+| 4096 | 262 144 | 2.36 ms | 1.27 ms | 1.77 ms | 1.86x | 57.6 | 450 |
+| 8192 | 524 288 | 4.67 ms | 1.88 ms | 2.84 ms | 2.48x | 77.5 | 606 |
+| 16384 | 1 048 576 | 9.30 ms | 3.19 ms | 4.96 ms | 2.91x | 91.7 | 716 |
+| 32768 | 2 097 152 | 18.57 ms | 5.85 ms | 9.21 ms | 3.17x | 99.8 | 780 |
+
+Correctness: relative error of batch element 0 against the fp32 torch reference is
+3.9e-4 ... 7.8e-4 for all three kernels and all lengths.
+
+What it shows:
+
+* the native kernel is linear (`8.9 ns/token`) but capped at 29-31 TFLOPS and
+  ~245 GB/s for every length: its grid is `batch` blocks, so 64 blocks over 16
+  cores run in four waves and each block is vector bound;
+* the paged kernel's per-token cost drops from 13.0 ns (kv=1024) to 2.8 ns
+  (kv=32768) because the 256 MiB of fp32 partials (16 splits x 64 batch x 128
+  heads x 512 dim) is a fixed cost; it only beats the native kernel from
+  kv >= 2048. At 32768 it reaches 99.8 TFLOPS (23% of the cube peak) and
+  788 GB/s (19.7% of the GM peak);
+* the persistent kernel is 0.63-0.83x of paged at batch=64: with 64 items per
+  core it loses the cross-block AIC/AIV overlap that the paged grid gets from its
+  `batch * splits` blocks (its win is the ragged batch, section 4);
+* fp16 partials do not help at this batch size either (kv=1024: 0.88 vs 0.85 ms,
+  kv=8192: 1.91 vs 1.88 ms): the halved traffic is offset by the widening pass in
+  the merge.
+
+**Split count matters as much as the kernel.** At batch=64 the optimal
+`num_split` scales with the KV length (measured, same harness):
+
+| kv_len | best num_split | paged | TFLOPS | GB/s | paged / native |
+|---:|---:|---:|---:|---:|---:|
+| 1024 | 1 (also 2) | 0.29 ms | 63.5 | 496 | 2.2x |
+| 1024 | 4 | 0.35 ms | 51.8 | 404 | 1.8x |
+| 1024 | 8 | 0.51 ms | 35.7 | 279 | 1.2x |
+| 4096 | 4 | 0.86 ms | 85.4 | 667 | 2.8x |
+| 8192 | 8 | 1.60 ms | 91.5 | 715 | 2.9x |
+| 16384 | 8 | 2.94 ms | 99.2 | 775 | 3.2x |
+| 32768 | 8 | 5.79 ms | 100.9 | 788 | 3.2x |
+
+The measured optimum matches `num_split = clamp(kv_tiles / 16, 1, 16)` (with
+`kv_tiles = ceil(kv_len / 64)`), i.e. keep about 16 tiles per split: 1/2/4/8/16/16
+against the measured 1/2/4/8/8/8 best points (within 8% at the two largest
+lengths). Callers pass `num_split` to `compile_mla_decode_paged`, so a serving
+layer should size it from the max live length instead of the fixed default 16.
+
 ## 5. Two-tile CV-overlap schedule (phase 1)
 
 Design: two KV tiles are kept in flight. K/K_pe of both tiles are prefetched into
@@ -267,7 +321,12 @@ the benchmark would run.
    would be a hand-written `T.MixedKernel` with explicit `T.Cube()` /
    `T.Vector()` regions and manual flags, or compiler support for cross-iteration
    multi-buffering.
-2. **packed length-proportional split plan** - keep the paged grid (and its
+2. **split-count sizing for serving** - the batch=64 sweep (section 4) shows the
+   optimal `num_split` follows the KV length (`clamp(kv_tiles / 16, 1, 16)`), and
+   a fixed 16 costs 2.9x at kv=1024 (0.85 -> 0.29 ms). A serving layer should pick
+   it from the max live length; the same plan is what the packed split idea below
+   generalises to uneven batches.
+4. **packed length-proportional split plan** - keep the paged grid (and its
    cross-block overlap) but balance the KV tiles per block from a global plan;
    this is the follow-up to the persistent probe (section 4), where balance won
    1.35x on a ragged batch but the one-block-per-core grid lost 0.72-0.89x on

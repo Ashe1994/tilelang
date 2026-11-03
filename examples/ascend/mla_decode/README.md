@@ -217,11 +217,33 @@ What it shows:
 | 16384 | 8 | 2.94 ms | 99.2 | 775 | 3.2x |
 | 32768 | 8 | 5.79 ms | 100.9 | 788 | 3.2x |
 
-The measured optimum matches `num_split = clamp(kv_tiles / 16, 1, 16)` (with
-`kv_tiles = ceil(kv_len / 64)`), i.e. keep about 16 tiles per split: 1/2/4/8/16/16
-against the measured 1/2/4/8/8/8 best points (within 8% at the two largest
-lengths). Callers pass `num_split` to `compile_mla_decode_paged`, so a serving
-layer should size it from the max live length instead of the fixed default 16.
+`compile_mla_decode_paged(num_split=None)` now sizes this automatically with
+`pick_num_split(max_pages * block_size, block_N, batch)`: about 16 KV tiles per
+split, at least `16 / batch` splits (so a single request still fills the machine)
+and at most 8 splits per batch element (beyond that the extra partial traffic buys
+nothing). The resulting table is 16/16/16/16/16/16 for batch=1 and
+1/2/4/8/8/8 for batch=64, which matches the measured optima, so a serving layer
+gets the short-KV win without passing anything: batch=64 / kv=1024 measures
+0.29 ms (2.2x native) instead of 0.85 ms with the old fixed 16, and kv=8192
+1.65 ms instead of 1.88 ms.
+
+### Where the 90% utilisation target stands
+
+Per KV tile (block_N=64) the pipes need `cube 1.32 us`, `mte2 1.68 us`,
+`vec ~1.49 us` per AIV and `fixpipe 0.98 us`. The measured block wall is
+2.55 us/tile at batch=64 / kv=32768, so the pipes overlap only partially and even
+a perfect overlap would stop at `max(...) = 1.68 us` -- **cube utilisation is
+capped near 79% by MTE2, not by the cube**. The cause is the double KV read
+(K for QK + transposed V for PV = 136 KB/tile against 72 KB for a single read),
+which the NT-only L1 GEMM forces. Cutting MTE2 to one read (0.89 us/tile) puts the
+cube at `1.32 / 0.9 = 1.47 us` of wall, the first configuration where 90% cube
+utilisation is reachable -- provided the cube/vector overlap is also perfect,
+which the auto-scheduler does not deliver today.
+
+Cube and GM cannot both approach 90% on this workload: at 90% cube the kernel runs
+~3.0 ms for batch=64 / kv=32768 and moves ~2.4 GB, i.e. ~790 GB/s (20% of the GM
+peak); saturating the GM peak would need ~890 TFLOPS, twice the fp16 peak. The
+realistic target is cube-bound at 90% with ~40% GM.
 
 ## Profile (msprof)
 

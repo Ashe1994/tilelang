@@ -80,7 +80,8 @@ def main():
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--rounds", type=int, default=2)
     ap.add_argument("--partial-dtype", default="float32", choices=("float32", "float16"))
-    ap.add_argument("--num-split", type=int, default=16)
+    ap.add_argument("--num-split", type=int, default=0, help="0 = auto from kv_len and batch")
+    ap.add_argument("--block-n", type=int, default=64)
     args = ap.parse_args()
     lens = [int(v) for v in args.lens.split(",")]
     scale = (D + PE) ** -0.5
@@ -100,35 +101,43 @@ def main():
         )
         pg = compile_mla_decode_paged(
             batch=batch, heads=H, num_slots=kv_all.shape[0], dim=D, pe_dim=PE,
-            block_size=64, max_pages=max_pages, block_N=64, num_split=args.num_split,
+            block_size=64, max_pages=max_pages, block_N=args.block_n, num_split=(args.num_split or None),
             softmax_scale=scale, partial_dtype=args.partial_dtype,
         )
-        ps = compile_mla_decode_persistent(
-            batch=batch, heads=H, num_slots=kv_all.shape[0], dim=D, pe_dim=PE,
-            block_size=64, max_pages=max_pages, block_N=64, num_split=args.num_split,
-            softmax_scale=scale, num_cores=16,
-        )
+        ps = None
+        if args.block_n == 64:  # the persistent prototype only supports this geometry
+            ps = compile_mla_decode_persistent(
+                batch=batch, heads=H, num_slots=kv_all.shape[0], dim=D, pe_dim=PE,
+                block_size=64, max_pages=max_pages, block_N=args.block_n,
+                num_split=(args.num_split or None),
+                softmax_scale=scale, num_cores=16,
+            )
 
         rows = []
-        for tag, run, call in (
+        variants = [
             ("native", nat, lambda: nat(q, q_pe, dense_kv, dense_kpe)),
             ("paged", pg, lambda: pg(q, q_pe, kv_all, kpe_all, table, seqlens)),
-            ("persist", ps, lambda: ps(q, q_pe, kv_all, kpe_all, table, seqlens)),
-        ):
+        ]
+        if ps is not None:
+            variants.append(
+                ("persist", ps, lambda: ps(q, q_pe, kv_all, kpe_all, table, seqlens))
+            )
+        for tag, run, call in variants:
             out = call()
             torch.npu.synchronize()
             r0 = rel(out[0], ref0)
             us = wall(call, args.rounds)
             rows.append((tag, us, r0))
 
-        line = [f"B64 kv={kv_len} batch={batch} tokens={tokens}"]
+        line = [f"B64 kv={kv_len} batch={batch} tokens={tokens} bn={args.block_n}"]
         for tag, us, r0 in rows:
             line.append(
                 f"{tag}={us / 1000.0:.2f}ms({flops / us / 1e3:.1f}T,"
                 f"{moved / (us * 1e-6) / 1e9:.0f}GB/s,rel0={r0:.5f})"
             )
         line.append(f"pg_vs_nat={rows[0][1] / rows[1][1]:.1f}x")
-        line.append(f"ps_vs_pg={rows[1][1] / rows[2][1]:.3f}x")
+        if len(rows) > 2:
+            line.append(f"ps_vs_pg={rows[1][1] / rows[2][1]:.3f}x")
         print(" ".join(line), flush=True)
         del q, q_pe, kv_all, kpe_all, dense_kv, dense_kpe, table, seqlens, ref0, nat, pg, ps
         torch.npu.empty_cache()

@@ -161,6 +161,41 @@ against the measured 1/2/4/8/8/8 best points (within 8% at the two largest
 lengths). Callers pass `num_split` to `compile_mla_decode_paged`, so a serving
 layer should size it from the max live length instead of the fixed default 16.
 
+### Automatic split sizing and the 90% utilisation target
+
+`compile_mla_decode_paged(num_split=None)` now derives the split count with
+`pick_num_split`: about 16 KV tiles per split, at least `16 / batch` splits and at
+most 8 per batch element. That reproduces the measured optima (batch=1: 16
+everywhere; batch=64: 1/2/4/8/8/8 for kv=1024..32768) and is covered by
+`test_pick_num_split` plus `test_paged_auto_split` (28/28 tests pass). The batch=64
+sweep with the automatic count: 0.29 / 0.46 / 0.85 / 1.65 / 3.03 / 5.86 ms for
+kv=1024..32768 against 0.85 / 0.97 / 1.27 / 1.88 / 3.19 / 5.85 ms with the old
+fixed 16 -- a 2.9x win at kv=1024 and no regression at the top end.
+
+`msprof` at batch=64 (`bench/prof_multi.py --variant paged`) gives the per-tile
+budget that bounds the utilisation target:
+
+| pipe | per tile | note |
+|---|---:|---|
+| AIC cube | 1.32 us | 10.55 us per 8-tile block at batch=1 |
+| AIC mte2 | 1.68 us | 136 KB/tile: K (72 KB) + transposed V (64 KB) |
+| AIV vec | ~1.49 us per AIV | softmax 4 passes + PV rescale |
+| AIC fixpipe | 0.98 us | |
+
+The measured block wall is 2.55 us/tile (kv=32768: 163 us per 64-tile block,
+512 blocks), so the pipes overlap partially and the perfect-overlap floor is
+`max = 1.68 us`. Consequences:
+
+* **cube busy cannot exceed ~79%** with the current traffic, because MTE2 is the
+  longest pipe; raising it needs the KV single read (0.89 us/tile), which the
+  NT-only L1 GEMM blocks (section 8);
+* **cube and GM cannot both be 90%**: at 90% cube the kernel would move ~2.4 GB in
+  ~3.0 ms (~790 GB/s, 20% of peak); saturating 3.6 TB/s would need ~890 TFLOPS,
+  twice the fp16 peak. The realistic target is cube-bound at 90% with ~40% GM;
+* the concrete order of work is therefore (1) KV single read (compiler support for
+  a transposed L1 operand), (2) vector-pass reduction so the vector pipe stops
+  being the second-longest, (3) more tiles in flight per core.
+
 ## 5. Two-tile CV-overlap schedule (phase 1)
 
 Design: two KV tiles are kept in flight. K/K_pe of both tiles are prefetched into

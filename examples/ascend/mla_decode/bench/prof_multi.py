@@ -26,7 +26,7 @@ PATH = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PATH))
 
 from example_mla_decode import compile_mla_decode
-from example_mla_decode_paged import select_phase1_kernel
+from example_mla_decode_paged import pick_num_split, select_phase1_kernel
 from mla_decode_persistent import mla_decode_persistent_fwd
 from test_mla_decode_paged import make_paged
 
@@ -40,6 +40,8 @@ def main():
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--lens", default=None, help="comma separated lengths, default uniform 8192")
     ap.add_argument("--cores", type=int, default=16)
+    ap.add_argument("--block-n", type=int, default=BN)
+    ap.add_argument("--num-split", type=int, default=0, help="0 = auto from kv_len and batch")
     args = ap.parse_args()
     scale = (D + PE) ** -0.5
 
@@ -63,15 +65,21 @@ def main():
         if args.lens
         else [8192] * args.batch
     )
+    if len(lens) == 1:
+        lens = lens * args.batch
     assert len(lens) == args.batch
+    ns = args.num_split or pick_num_split(max(lens), args.block_n, args.batch)
     q, qp, kv, kp, table, seqlens, mp = make_paged(args.batch, lens, BS, seed=5)
     if args.variant == "paged":
-        fwd, dual = select_phase1_kernel(BN, BS, 128, kv_hint=mp * BS, num_split=NS)
+        fwd, dual = select_phase1_kernel(
+            args.block_n, BS, 64 if args.block_n >= 128 else 128,
+            kv_hint=mp * BS, num_split=ns,
+        )
     else:
         fwd, dual = mla_decode_persistent_fwd, True
     kwargs = dict(
         batch=args.batch, heads=H, num_slots=kv.shape[0], dim=D, pe_dim=PE,
-        block_size=BS, max_pages=mp, block_N=BN, num_split=NS, softmax_scale=scale,
+        block_size=BS, max_pages=mp, block_N=args.block_n, num_split=ns, softmax_scale=scale,
     )
     if args.variant == "persistent":
         kwargs.update(num_cores=args.cores, persistent_stages=0)

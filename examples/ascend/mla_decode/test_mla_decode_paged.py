@@ -29,7 +29,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-from example_mla_decode_paged import compile_mla_decode_paged
+from example_mla_decode_paged import compile_mla_decode_paged, pick_num_split
 
 D, PE = 512, 64
 
@@ -238,3 +238,32 @@ def test_block_table_is_honoured():
     assert not torch.allclose(out_a, out_b, rtol=1e-2, atol=1e-2), (
         "repointing a page did not change the output: block_table is being ignored"
     )
+
+@tilelang.testing.requires_ascend
+def test_pick_num_split():
+    """The split sizing rule matches the measured batch=64 optimum."""
+    assert pick_num_split(8192, 64, 1) == 16       # one request needs all 16 cores
+    assert pick_num_split(1024, 64, 1) == 16
+    assert pick_num_split(1024, 64, 64) == 1       # big batch, short KV: no split
+    assert pick_num_split(2048, 64, 64) == 2
+    assert pick_num_split(4096, 64, 64) == 4
+    assert pick_num_split(8192, 64, 64) == 8
+    assert pick_num_split(32768, 64, 64) == 16
+    assert pick_num_split(64, 64, 64) == 1         # never more splits than tiles
+    assert pick_num_split(1024, 64, 4) == 4        # 16 cores / batch=4
+
+
+@tilelang.testing.requires_ascend
+def test_paged_auto_split():
+    """num_split=None picks the split count from the KV length and the batch."""
+    scale = (D + PE) ** -0.5
+    q, q_pe, kv, k_pe, table, seqlens, max_pages = make_paged(4, [2048] * 4, 64, seed=7)
+    run = compile_mla_decode_paged(
+        batch=4, heads=128, num_slots=kv.shape[0], dim=D, pe_dim=PE,
+        block_size=64, max_pages=max_pages, block_N=64, softmax_scale=scale,
+    )
+    out = run(q, q_pe, kv, k_pe, table, seqlens)
+    torch.npu.synchronize()
+    exp = ref_paged(q, q_pe, kv, k_pe, table, seqlens, 64, scale).float()
+    rel = (out.float() - exp).abs().max().item() / exp.abs().max().item()
+    assert rel < 1e-2, f"auto split rel={rel:.5f}"

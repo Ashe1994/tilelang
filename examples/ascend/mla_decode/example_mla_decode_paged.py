@@ -85,6 +85,32 @@ def effective_split(kv_len, block_N, num_split):
     return ns
 
 
+def pick_num_split(kv_len, block_N, batch, num_cores=16, max_split=16):
+    """Split count for the paged phase 1, sized from the KV length and the batch.
+
+    Two forces set the split count:
+
+    * the per-split partial write/read is a fixed cost (`num_split * batch * heads
+      * dim * 4` bytes of fp32 partials), so a long sequence amortises many
+      splits while a short one should use very few -- measured at batch=64:
+      kv=1024 wants 1 split (0.29 ms vs 0.85 ms at 16), kv=8192 wants 8;
+    * the grid is `batch * num_split` blocks, so a single batch element still
+      needs `num_cores` splits to fill the machine.
+
+    The measured optimum matches ``kv_tiles // 16`` (about 16 KV tiles per split)
+    once there are enough blocks. Callers that pass ``num_split`` explicitly keep
+    the previous fixed behaviour.
+    """
+    kv_tiles = max(1, (kv_len + block_N - 1) // block_N)
+    # Eight splits is the measured cap per batch element: beyond it the partial
+    # traffic doubles for no latency gain (batch=64: kv=16384/32768 prefer 8 over
+    # 16 by 1-8%), while a single batch element still needs 16 splits to fill the
+    # machine.
+    by_work = max(1, min(8, kv_tiles // 16))
+    by_parallel = max(1, (num_cores + max(1, batch) - 1) // max(1, batch))
+    return max(1, min(kv_tiles, max_split, max(by_work, by_parallel)))
+
+
 
 # The paged kernel carries one score tile per page chunk, so it trims the ML row
 # from 32 to 8 floats (still one 32 B DMA granule) to stay inside the UB budget.
@@ -1054,7 +1080,7 @@ def compile_mla_decode_paged(
     block_N=64,
     chunk_d=None,
     softmax_scale=None,
-    num_split=16,
+    num_split=None,
     threads=1024,
     num_stages=2,
     fuse_rescale=True,
@@ -1076,6 +1102,10 @@ def compile_mla_decode_paged(
     a per-page score tile is only 64 columns wide, so the explicit MicroAPI path
     measured no gain (phase 1 49.2 vs 49.1 us) and only adds UB pressure.
 
+    ``num_split=None`` sizes the split count from ``max_pages * block_size`` and
+    the batch with :func:`pick_num_split` (about 16 KV tiles per split, and at
+    least ``num_cores / batch`` splits); pass an integer to freeze it.
+
     ``partial_dtype`` must be the same on both phases: the shared merge kernel
     declares the ``O_partial`` input with this dtype. The ``out_idx`` positions of
     phase 1 are unchanged (only the element type of output 6 changes).
@@ -1086,6 +1116,8 @@ def compile_mla_decode_paged(
     _, chunk_d, merge_chunk_d = pick_tiling(
         max_pages * block_size, dim, block_N, chunk_d, merge_chunk_d
     )
+    if num_split is None:
+        num_split = pick_num_split(max_pages * block_size, block_N, batch)
 
     fwd, _dual = select_phase1_kernel(
         block_N, block_size, chunk_d, kv_hint=max_pages * block_size, num_split=num_split

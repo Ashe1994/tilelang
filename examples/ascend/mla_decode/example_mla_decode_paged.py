@@ -458,6 +458,7 @@ def mla_decode_paged_fwd_dual(
     vector_mode="simd_rc",
     stage_cols=None,
     pv_l0=False,
+    pair_stages=1,
 ):
     """Phase 1: per-split partial output + log-sum-exp over a paged KV cache.
 
@@ -628,7 +629,7 @@ def mla_decode_paged_fwd_dual(
             # Two KV tiles per iteration: K/K_pe of both slots are prefetched and
             # both QK GEMMs are issued, then slot 0's softmax runs while the cube
             # finishes slot 1's QK, then slot 1's softmax, then the two PV passes.
-            for pair in T.Pipelined(T.ceildiv(loop_range, TILE_SLOTS), num_stages=1):
+            for pair in T.Pipelined(T.ceildiv(loop_range, TILE_SLOTS), num_stages=pair_stages):
                 for ti, _t in enumerate(range(TILE_SLOTS)):
                     kv_blk = first + pair * TILE_SLOTS + ti
                     kv_blk_safe = T.min(kv_blk, first + loop_range - 1)
@@ -1113,6 +1114,7 @@ def compile_mla_decode_paged(
     merge_vector_mode="simd",
     stage_cols=None,
     pv_l0=False,
+    pair_stages=1,
 ):
     """Compile phase 1 + the shared merge kernel, return one callable.
 
@@ -1149,6 +1151,10 @@ def compile_mla_decode_paged(
         block_N, block_size, chunk_d, kv_hint=max_pages * block_size, num_split=num_split
     )
 
+    # pv_l0 (single KV read) needs the PTO backend: the AscendC L0 GEMM faults on
+    # the K-major/MN-major layout mismatch, so select the target with the flag.
+    backend = "pto" if pv_l0 else None
+
     partial = tilelang.compile(
         fwd(
             batch=batch,
@@ -1172,8 +1178,10 @@ def compile_mla_decode_paged(
             vector_mode=vector_mode,
             stage_cols=stage_cols,
             pv_l0=pv_l0,
+            pair_stages=pair_stages,
         ),
         out_idx=[6, 7],
+        target=backend,
     )
     merge = tilelang.compile(
         mla_decode_merge(
@@ -1194,6 +1202,7 @@ def compile_mla_decode_paged(
             merge_vector_mode=merge_vector_mode,
         ),
         out_idx=[2],
+        target=backend,
     )
 
     def run(q, q_pe, kv, k_pe, block_table, cache_seqlens):

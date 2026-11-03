@@ -252,14 +252,20 @@ pass, and the fully fused variant needs +16 KiB of UB), and computing PV as
 `P @ K` on L0 operands -- the single-read path -- compiles but faults the AI core
 because the K tile is K-major for the QK operand and MN-major for the NN PV
 operand, which the L1->L0B copy cannot convert. The single-read path did land on the **PTO
-backend**: `compile_mla_decode_paged(pv_l0=True)` with `target="pto"` computes PV
-as `P @ K` on L0 operands, so the KV tensor is read once (72 KB/tile instead of
-136 KB) and the measured batch=64 numbers improve by 5% (kv=8192: 1.65 -> 1.57 ms,
-kv=32768: 5.86 -> 5.57 ms, relative error unchanged). The AscendC backend faults
-on the same program, and `msprof` cannot profile PTO kernels here, so `pv_l0`
-stays opt-in and the default remains AscendC. The utilisation target is still
-blocked by (a) cross-iteration multi-buffering for near-perfect CV overlap and
-(b) PTO as the deployment backend (plus pipe-level profiling for it).
+backend**: `compile_mla_decode_paged(pv_l0=True)` computes PV as `P @ K` on L0
+operands (the compile entry selects `target="pto"` automatically for it), so the
+KV tensor is read once -- 72 KB/tile instead of 136 KB -- and the batch=64 numbers
+improve by 5% (kv=8192: 1.65 -> 1.56 ms, kv=32768: 5.86 -> 5.47 ms with
+`pair_stages=2`, relative error unchanged). The AscendC backend faults on the same
+program, and `msprof` cannot profile PTO kernels here, so `pv_l0` stays opt-in and
+the default remains AscendC.
+
+With the single read the per-tile pipe budget becomes cube 1.32 us, mte2 0.89 us,
+vec ~1.49 us and fixpipe 0.98 us, i.e. the vector pipe is now the longest and a
+perfectly overlapped kernel would reach 1.49 us/tile (cube ceiling ~89%). The
+measured wall is 2.64 us/tile, so the remaining gap is the dependency chain the
+auto-scheduler does not overlap -- the utilisation target is blocked by
+cross-iteration multi-buffering, not by traffic any more.
 
 ## Profile (msprof)
 

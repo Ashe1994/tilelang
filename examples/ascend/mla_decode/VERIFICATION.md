@@ -207,8 +207,8 @@ need. Measured at batch=64 with `num_split=8` (event timing, 2 rounds):
 
 | case | staged V^T (ascend) | single read (pto + pv_l0) | delta |
 |---|---:|---:|---:|
-| kv=8192 | 1.65 ms | **1.57 ms** | -4.8% |
-| kv=32768 | 5.86 ms | **5.57 ms** | -5.0% |
+| kv=8192 | 1.65 ms | **1.56 ms** | -5.5% |
+| kv=32768 | 5.86 ms | **5.47 ms** | -6.7% |
 
 MTE2 traffic per tile drops from 136 KB (K + transposed V) to 72 KB (K only) by
 construction, and the relative error is unchanged (6.6e-4 / 6.3e-4). Three tile
@@ -218,9 +218,18 @@ environment ("profiling results are empty"), so the pipe-level split of the PTO
 build is not captured yet; the PTO-only path is exposed as an opt-in flag and the
 default stays on the AscendC backend.
 
-Reaching 90% cube utilisation still needs cross-iteration multi-buffering (or a
-manually scheduled mixed kernel), and the single-read path needs PTO as the
-deployment backend.
+`pair_stages=2` (cross-iteration pipelining of the pair loop) was measured on top
+of the single read: kv=32768 5.47 vs 5.52 ms (-0.9%), kv=8192 neutral, so the
+auto-scheduler gains little from the extra buffering. With the single read the
+per-tile budget is cube 1.32 / mte2 0.89 / vec ~1.49 / fixpipe 0.98 us, i.e. the
+vector pipe is now the longest and a perfectly overlapped kernel would reach
+1.49 us/tile (cube ceiling ~89%); the measured wall is 2.64 us/tile, so the
+remaining gap is dependency-chain overlap. Reaching 90% cube utilisation still
+needs cross-iteration multi-buffering (or a manually scheduled mixed kernel).
+
+`compile_mla_decode_paged(pv_l0=True)` now selects `target="pto"` for both phases
+internally, so callers do not have to set the environment; the default
+(`pv_l0=False`) stays on the AscendC backend.
 
 ## 5. Two-tile CV-overlap schedule (phase 1)
 

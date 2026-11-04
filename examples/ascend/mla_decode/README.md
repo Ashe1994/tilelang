@@ -276,6 +276,18 @@ difference, so they are not in the kernel:
   2.827 vs 2.815 ms at kv=16384 (0.1-0.4%, slightly slower), matching the earlier
   batch=1 result.
 
+### Ragged-batch balance: attempted, blocked
+
+A packed split plan (per-sequence split counts, each block given an even KV tile
+range) was tried twice at batch=64: with a plan tensor in the address math the
+kernel is correct but 10-26x slower (39.4 vs 1.49 ms at kv=8192) because every
+unused slot still publishes a 256 KB partial; with per-sequence counts and an
+`if loop_range > 0` guard around the tile body it is 3.2x slower *and* returns
+wrong results for small batches -- the backend's ThreadSync pass warns that it
+hoists barriers out of the branch ("the race remains"). The idea stays unimplemented
+on this compiler; a merge-side per-batch split bound with zero-initialised
+partials would need caller-allocated outputs.
+
 ## Profile (msprof)
 
 Captured with

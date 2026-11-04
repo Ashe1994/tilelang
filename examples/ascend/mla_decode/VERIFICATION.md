@@ -314,6 +314,7 @@ no tier is bandwidth limited.
 | merge `tmp` x4 versions on the paged (fp32-partial) merge | e2e 56.85 -> 56.92 us, phase 1 49.11 -> 49.05 us: no effect | closed |
 | page 128 | identical to page 64 in both schedules | closed |
 | fused softmax (scale/mask folded into the row-max reducer, score tile read-only) | semi-fused: e2e 6.77 vs 5.82 ms at batch=64/kv=32768 (+16%) and 1.88 vs 1.59 ms at kv=8192; a reducer over a select/multiply expression lowers to a scalar pass. The fully-fused variant additionally needs +16 KiB UB (224512 > 221184) | closed |
+| packed length-proportional split plan (A1): per-sequence `ns_batch` + a plan tensor so each block gets an even tile range | **v1 (plan tensor in the address math)**: correct results but 10-26x slower (batch=64/kv=8192: 39.4 vs 1.49 ms) -- every unused slot still loads Q (144 KB) and publishes a 256 KB fp32 partial, and the plan-derived loop bounds defeat the scheduler. **v2 (per-sequence counts + `if loop_range > 0` around the tile body)**: 9x faster than v1 but still 3.2x slower than paged (4.4 vs 1.49 ms) and **wrong** for batch<=8 (rel 0.67-2.33); the backend's ThreadSync pass itself warns "Hoisting sync out of an if ... the race remains". Blocked: there is no safe way to skip a block's tile body on this compiler | closed |
 | forcing `s_ub`/`p_ub` to 2 versions (`annotate_buffer_versions`, `pair_stages` 1 or 2) | the compiler reports success and the kernel runs in 0.19-0.30 ms, but the output is silently wrong: fresh data gives rel=1.000 (all zeros) at batch=64 and rel=206 at batch=8, while `pair_stages`/versions 0 is correct at 5.28 ms. Removed; the auto-scheduler's own versioning is the only safe path | closed |
 | PV as `P @ K` on L0 operands (single KV read, `transpose_B=False`) | **AscendC backend**: compiles but the AI core faults (device error 507015) -- the K tile is K-major for QK and MN-major for the NN PV operand and the L1->L0B copy cannot convert majors. **PTO backend**: ran correctly and was faster (5.47 vs 5.86 ms at batch=64/kv=32768), but PTO is not used -- the parameter, the `pair_stages` knob and the automatic `target="pto"` selection were **removed from the code**; the numbers are kept here for reference | archived |
 | three KV tiles in flight (`TILE_SLOTS=3`) | phase 1 50.9 vs 43.6 us, e2e 58.7 vs 52.6 us; L1 at ~496 KiB leaves the scheduler no room | closed |
@@ -400,6 +401,13 @@ the benchmark would run.
    compiler.
 5. **split-count sizing** is automatic now (`pick_num_split`, section 4); a
    serving layer only has to leave `num_split=None` (the default).
+6. **ragged-batch balance (packed split plan)** - attempted in two forms and
+   blocked (section 8): without an `if` the unused slots pay a full 256 KB
+   partial publish, and with an `if` around the tile body the compiler's
+   ThreadSync pass hoists barriers out of the branch and the kernel returns wrong
+   results. A merge-side per-batch bound plus zero-initialised partials would need
+   caller-allocated outputs; that is the only remaining route and its payoff is
+   unmeasured.
 
 ## 12. History
 

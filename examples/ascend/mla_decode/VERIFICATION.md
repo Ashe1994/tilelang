@@ -362,6 +362,7 @@ no tier is bandwidth limited.
 | merge `tmp` x4 versions on the paged (fp32-partial) merge | e2e 56.85 -> 56.92 us, phase 1 49.11 -> 49.05 us: no effect | closed |
 | page 128 | identical to page 64 in both schedules | closed |
 | fused softmax (scale/mask folded into the row-max reducer, score tile read-only) | semi-fused: e2e 6.77 vs 5.82 ms at batch=64/kv=32768 (+16%) and 1.88 vs 1.59 ms at kv=8192; a reducer over a select/multiply expression lowers to a scalar pass. The fully-fused variant additionally needs +16 KiB UB (224512 > 221184) | closed |
+| wider output chunk `chunk_d=256` (half the V^T DMA instructions, wider PV GEMM) | the single-tile schedule rejects it at compile time (Z3 `shared` capacity 89600 < 98688); with the two-tile schedule it compiles but the launch fails (`rtsLaunchKernelWithHostArgs`, invalid argument -- the dynamic UBUF/geometry exceeds what the runtime accepts). `chunk_d=128` stays | closed |
 | single 64 KiB transposed V^T tile per KV tile (one large DMA instead of `NUM_DC` small ones) | wrong results (rel 0.88): the L1 NZ tile cannot be sliced per `chunk_d` the way separate per-chunk tiles can; also no faster (1.547 vs 1.557 ms at B=64/kv=8192) | closed |
 | packed length-proportional split plan (A1): per-sequence `ns_batch` + a plan tensor so each block gets an even tile range | **v1 (plan tensor in the address math)**: correct results but 10-26x slower (batch=64/kv=8192: 39.4 vs 1.49 ms) -- every unused slot still loads Q (144 KB) and publishes a 256 KB fp32 partial, and the plan-derived loop bounds defeat the scheduler. **v2 (per-sequence counts + `if loop_range > 0` around the tile body)**: 9x faster than v1 but still 3.2x slower than paged (4.4 vs 1.49 ms) and **wrong** for batch<=8 (rel 0.67-2.33); the backend's ThreadSync pass itself warns "Hoisting sync out of an if ... the race remains". Blocked: there is no safe way to skip a block's tile body on this compiler | closed |
 | forcing `s_ub`/`p_ub` to 2 versions (`annotate_buffer_versions`, `pair_stages` 1 or 2) | the compiler reports success and the kernel runs in 0.19-0.30 ms, but the output is silently wrong: fresh data gives rel=1.000 (all zeros) at batch=64 and rel=206 at batch=8, while `pair_stages`/versions 0 is correct at 5.28 ms. Removed; the auto-scheduler's own versioning is the only safe path | closed |
@@ -422,6 +423,14 @@ msprof op --warm-up=10 --launch-count=5 \
     --output=/dev/shm/prof/paged python bench/prof_paged.py --block-size 64
 python bench/parse_pipes.py paged=/dev/shm/prof/paged
 ```
+
+For MindStudio Insight, capture with `msopprof` and include the `PipeTimeline`
+metric (`--aic-metrics=Default,Roofline,Occupancy,BasicInfo,MemoryDetail,PipeUtilization,PipeTimeline`);
+that is what produces `trace.json` + `dump/timeline.bin.*` next to
+`visualize_data.bin` and populates the Timeline view on 950PR. `TimelineDetail`
+alone yields only details and `InstrTimeline` failed on this host, while the
+detail-oriented metric set used for the first export (no `PipeTimeline`) leaves
+the Timeline empty.
 
 `bench/prof_paged.py` selects the same phase-1 kernel as the compile entry
 (it prints `dual_schedule=True/False`), so the capture always profiles the kernel

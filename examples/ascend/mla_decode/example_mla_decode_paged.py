@@ -898,6 +898,7 @@ def mla_decode_merge(
         O: T.Tensor((batch, heads, dim), dtype),
     ):
         with T.Kernel(NUM_BLOCKS) as bx:
+            T.annotate_unlimit_memory("shared", "shared.l1")
             b = bx // (NUM_M_TILES * NUM_DC * RSPLIT)
             rem = bx % (NUM_M_TILES * NUM_DC * RSPLIT)
             h0 = (rem // (NUM_DC * RSPLIT)) * block_H + (rem % RSPLIT) * RP

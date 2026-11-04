@@ -109,7 +109,14 @@ def pick_num_split(kv_len, block_N, batch, num_cores=16, max_split=16):
     # NS=2/4/8 over NS=4/8/16 by 4-8%; kv=32768 is flat between 8 and 16.
     by_work = min(8, max(2, kv_tiles // 32))
     by_parallel = max(1, (num_cores + max(1, batch) - 1) // max(1, batch))
-    return max(1, min(kv_tiles, max_split, max(by_work, by_parallel)))
+    ns = max(1, min(kv_tiles, max_split, max(by_work, by_parallel)))
+    # Measured (kv=8192): batch=8 wants ns=8 (0.254 ms) instead of the ns=4 the
+    # work/parallel rule gives (0.303 ms, -16%), while batch=4 is equal at 4 and
+    # 16 and batch=64 prefers 4 (1.496 vs 1.560 ms at ns=8). 8..16 therefore get
+    # an explicit floor of 8 splits.
+    if 8 <= batch <= 16:
+        ns = max(ns, min(8, kv_tiles))
+    return ns
 
 
 

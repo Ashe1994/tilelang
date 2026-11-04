@@ -288,6 +288,17 @@ hoists barriers out of the branch ("the race remains"). The idea stays unimpleme
 on this compiler; a merge-side per-batch split bound with zero-initialised
 partials would need caller-allocated outputs.
 
+### CANN comparison (FIA, AscendC)
+
+CANN 9.3's fused infer attention (`npu_fused_infer_attention_score`, MLA mode via
+`query_rope`/`key_rope` + page attention) is the AscendC counterpart of this
+kernel. Measured on the same tensors: **1.50x faster at B=1/kv=8192, 1.65x at
+B=64/kv=8192, 1.53x at B=64/kv=32768** (151 TFLOPS / 35% of the fp16 peak at
+B=64). It is MTE2-bound (77.5% busy, 1416 GB/s) while this kernel is at ~59% MTE2
+and 825 GB/s, so the remaining gap is feed efficiency, not traffic. FIA also only
+reaches 35% of peak, i.e. the 90% target is not met by CANN's own implementation
+either. Details and the msprof comparison are in `VERIFICATION.md` (section 4).
+
 ## Profile (msprof)
 
 Captured with

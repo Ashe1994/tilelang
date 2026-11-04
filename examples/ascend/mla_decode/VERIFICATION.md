@@ -168,7 +168,10 @@ layer should size it from the max live length instead of the fixed default 16.
 least two splits per batch element, at least `16 / batch` splits, at most 8 per
 batch element. Batch=1 keeps 16 everywhere; batch=64 gets 2/2/2/4/8/8.
 
-The denser sweep (batch=64, DT host, 2 rounds median) that set the rule:
+The rule also gives batch 8..16 a floor of 8 splits (measured at kv=8192:
+batch=8 0.303 ms at ns=4 vs **0.254 ms** at ns=8, -16%; batch=4 ties at 4 and 16
+and batch=64 prefers 4). The denser sweep (batch=64, DT host, 2 rounds median) that
+set the 32-tiles-per-split target:
 
 | kv_len | best num_split | e2e | TFLOPS | previous rule / its e2e |
 |---:|---:|---:|---:|---|
@@ -223,6 +226,51 @@ with `transpose_B=False` faults the AI core on AscendC (K-major vs MN-major
 layout), and although the PTO backend ran it correctly at 5.47 vs 5.86 ms
 (batch=64, kv=32768), PTO is not used, so `pv_l0`, `pair_stages` and the automatic
 `target="pto"` selection were removed. The measurements stay here for reference.
+
+### CANN reference implementation: FIA with MLA rope
+
+CANN 9.3 ships the following MLA-related AscendC operators: `npu_mla_prolog` /
+`_v2` / `_v3` / `_v4` (the Q/KV projection and cache write, not the attention
+core), `sparse_flash_mla*` (DSA sparse attention) and
+`npu_fused_infer_attention_score` (**FIA**, the fused attention engine, which
+takes `query_rope` / `key_rope` and a `block_table`, i.e. MLA decode). FIA is the
+counterpart of this kernel and was benchmarked on the same tensors.
+
+Layout requirement found by probing: for page attention on this device FIA needs
+`input_layout="BNSD"` with the cache shaped `[num_blocks, N=1, block_size, D]`
+(the BSND `[num_blocks, block_size, N, D]` form is rejected by tiling with
+"the axis N of key must be equal to N2(1)").
+
+Same-process comparison, fp16, `do_bench` 2 rounds median, PR host:
+
+| case | FIA (CANN AscendC) | this kernel | FIA speedup | rel (both) |
+|---|---:|---:|---:|---:|
+| B=1, kv=8192 | **0.036 ms (63.3 TFLOPS)** | 0.054 ms (42.1 TFLOPS) | **1.50x** | 5.6e-4 |
+| B=64, kv=8192 | **0.966 ms (151.2 TFLOPS, 35.0% peak)** | 1.588 ms (91.9 TFLOPS) | **1.65x** | 6.6e-4 |
+| B=64, kv=32768 | **3.859 ms (151.4 TFLOPS, 35.0% peak)** | 5.887 ms (99.2 TFLOPS) | **1.53x** | 6.3e-4 |
+
+`msprof` at B=64 / kv=8192 (`msopprof` capture, `insight_export/fia_b64_kv8192`):
+
+| kernel | duration | cube | mte2 | vec | L2 hit | GB/s |
+|---|---:|---:|---:|---:|---:|---:|
+| FIA | 861.6 us | 44.8% | **77.5%** | 21.1% | 2.4% | **1416 (35.4%)** |
+| this kernel | 1429.5 us | ~47% (per-block) | ~59% (per-block) | 99.3 us/block | 48.7% | 825 (20.6%) |
+
+Both kernels move ~1.15-1.19 GB for the case. FIA wins by feeding the pipes more
+efficiently (MTE2 77.5% busy, 1.4x the bandwidth) even with a 2.4% L2 hit, while
+this kernel spends relatively more time in the vector pipeline. Notably FIA also
+only reaches **35% of the fp16 peak**, so the 90% utilisation target is not
+reached by CANN's own AscendC implementation either; it is a property of the
+dataflow (KV double read + per-tile softmax/rescale) on this compiler, not of the
+tilelang kernel alone.
+
+One small optimisation adopted from this comparison: the split rule now gives
+batch 8..16 an explicit floor of 8 splits (measured at kv=8192: batch=8 went from
+0.303 ms at ns=4 to **0.254 ms** at ns=8, -16%; batch=4 and batch=64 keep their
+measured optima of 4). A single 64 KiB transposed V^T tile (one DMA per tile
+instead of `NUM_DC`) was also tried and **rejected**: it returns wrong results
+(rel 0.88) because the L1 NZ tile cannot be sliced per `chunk_d` the way the
+per-chunk tiles are, and it measured no faster (1.547 vs 1.557 ms).
 
 ## 5. Two-tile CV-overlap schedule (phase 1)
 
@@ -314,6 +362,7 @@ no tier is bandwidth limited.
 | merge `tmp` x4 versions on the paged (fp32-partial) merge | e2e 56.85 -> 56.92 us, phase 1 49.11 -> 49.05 us: no effect | closed |
 | page 128 | identical to page 64 in both schedules | closed |
 | fused softmax (scale/mask folded into the row-max reducer, score tile read-only) | semi-fused: e2e 6.77 vs 5.82 ms at batch=64/kv=32768 (+16%) and 1.88 vs 1.59 ms at kv=8192; a reducer over a select/multiply expression lowers to a scalar pass. The fully-fused variant additionally needs +16 KiB UB (224512 > 221184) | closed |
+| single 64 KiB transposed V^T tile per KV tile (one large DMA instead of `NUM_DC` small ones) | wrong results (rel 0.88): the L1 NZ tile cannot be sliced per `chunk_d` the way separate per-chunk tiles can; also no faster (1.547 vs 1.557 ms at B=64/kv=8192) | closed |
 | packed length-proportional split plan (A1): per-sequence `ns_batch` + a plan tensor so each block gets an even tile range | **v1 (plan tensor in the address math)**: correct results but 10-26x slower (batch=64/kv=8192: 39.4 vs 1.49 ms) -- every unused slot still loads Q (144 KB) and publishes a 256 KB fp32 partial, and the plan-derived loop bounds defeat the scheduler. **v2 (per-sequence counts + `if loop_range > 0` around the tile body)**: 9x faster than v1 but still 3.2x slower than paged (4.4 vs 1.49 ms) and **wrong** for batch<=8 (rel 0.67-2.33); the backend's ThreadSync pass itself warns "Hoisting sync out of an if ... the race remains". Blocked: there is no safe way to skip a block's tile body on this compiler | closed |
 | forcing `s_ub`/`p_ub` to 2 versions (`annotate_buffer_versions`, `pair_stages` 1 or 2) | the compiler reports success and the kernel runs in 0.19-0.30 ms, but the output is silently wrong: fresh data gives rel=1.000 (all zeros) at batch=64 and rel=206 at batch=8, while `pair_stages`/versions 0 is correct at 5.28 ms. Removed; the auto-scheduler's own versioning is the only safe path | closed |
 | PV as `P @ K` on L0 operands (single KV read, `transpose_B=False`) | **AscendC backend**: compiles but the AI core faults (device error 507015) -- the K tile is K-major for QK and MN-major for the NN PV operand and the L1->L0B copy cannot convert majors. **PTO backend**: ran correctly and was faster (5.47 vs 5.86 ms at batch=64/kv=32768), but PTO is not used -- the parameter, the `pair_stages` knob and the automatic `target="pto"` selection were **removed from the code**; the numbers are kept here for reference | archived |

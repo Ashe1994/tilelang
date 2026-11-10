@@ -1079,7 +1079,8 @@ def mla_decode_merge(
     return merge_main
 
 
-def select_phase1_kernel(block_N, block_size, chunk_d, kv_hint=None, num_split=16):
+def select_phase1_kernel(block_N, block_size, chunk_d, kv_hint=None, num_split=16,
+                        phase1_impl="auto"):
     """Return ``(phase1_builder, uses_dual_schedule)`` for a page geometry.
 
     The two-tile CV-overlap schedule needs one page chunk per tile (its tile
@@ -1092,7 +1093,11 @@ def select_phase1_kernel(block_N, block_size, chunk_d, kv_hint=None, num_split=1
     """
     num_pc = max(1, block_N // block_size)
     enough_tiles = kv_hint is None or (kv_hint // block_N) >= 2 * max(1, num_split)
-    dual = num_pc == 1 and block_N == 64 and chunk_d == 128 and enough_tiles
+    dual = num_pc == 1 and block_N == 64 and chunk_d == 128
+    if phase1_impl == "single":
+        dual = False
+    elif phase1_impl == "dual":
+        dual = True and enough_tiles
     return (mla_decode_paged_fwd_dual, True) if dual else (mla_decode_paged_fwd, False)
 
 
@@ -1123,6 +1128,7 @@ def compile_mla_decode_paged(
     tile_slots=2,
     block_H=128,
     v_slots=1,
+    phase1_impl="auto",
 ):
     """Compile phase 1 + the shared merge kernel, return one callable.
 
@@ -1150,7 +1156,8 @@ def compile_mla_decode_paged(
         num_split = pick_num_split(max_pages * block_size, block_N, batch)
 
     fwd, _dual = select_phase1_kernel(
-        block_N, block_size, chunk_d, kv_hint=max_pages * block_size, num_split=num_split
+        block_N, block_size, chunk_d, kv_hint=max_pages * block_size, num_split=num_split,
+        phase1_impl=phase1_impl,
     )
 
     partial = tilelang.compile(

@@ -264,6 +264,14 @@ reached by CANN's own AscendC implementation either; it is a property of the
 dataflow (KV double read + per-tile softmax/rescale) on this compiler, not of the
 tilelang kernel alone.
 
+All the structural ways to close that feed-efficiency gap that this compiler
+allows were measured (see the dead-end table): a single KV read is impossible
+because the L1 GEMM path is NT-only, a 64-row head tile is impossible because
+`T.dual_copy` needs M=128, and neither V double buffering nor a 3-4 slot K
+pipeline helps (3 slots is 20% slower). What remains is hand-written multi-stage
+scheduling (what FIA does) or NN-GEMM support in the compiler; the pragmatic
+route for a serving layer is to call FIA for the decode attention itself.
+
 One small optimisation adopted from this comparison: the split rule now gives
 batch 8..16 an explicit floor of 8 splits (measured at kv=8192: batch=8 went from
 0.303 ms at ns=4 to **0.254 ms** at ns=8, -16%; batch=4 and batch=64 keep their
@@ -362,6 +370,10 @@ no tier is bandwidth limited.
 | merge `tmp` x4 versions on the paged (fp32-partial) merge | e2e 56.85 -> 56.92 us, phase 1 49.11 -> 49.05 us: no effect | closed |
 | page 128 | identical to page 64 in both schedules | closed |
 | fused softmax (scale/mask folded into the row-max reducer, score tile read-only) | semi-fused: e2e 6.77 vs 5.82 ms at batch=64/kv=32768 (+16%) and 1.88 vs 1.59 ms at kv=8192; a reducer over a select/multiply expression lowers to a scalar pass. The fully-fused variant additionally needs +16 KiB UB (224512 > 221184) | closed |
+| single KV read by reusing the QK K tile as the PV B operand (`transpose_B=False`) | **blocked by the backend**: `Ascend L1 GEMM currently only supports trans_A=False, trans_B=True (NT)`, so the transposed V tile is mandatory and the KV cache must be read twice (FIA reads 1.19 GB for the same shape, i.e. also twice) | closed |
+| head tile `block_H=64` to free L1 for a deeper KV pipeline | **blocked by `T.dual_copy`**: the 2:1 L0C->UB M-split requires M=128, so phase 1 cannot use a 64-row head tile | closed |
+| `v_slots=2` (double-buffered V^T, V load issued in the load phase) | 1.520 vs 1.518 ms (B=64/kv=8192), 5.785 vs 5.761 ms (kv=32768), 0.053 vs 0.054 ms (B=1) -- within noise; the compiler already overlaps what it can, and the MTE2 idle time is not caused by the V load | closed |
+| `tile_slots=3/4` (deeper K pipeline) | 3 slots: 1.830 vs 1.519 ms at B=64/kv=8192 (-20%) and 5.875 vs 5.796 ms at kv=32768; 4 slots exceeds L1 and fails at launch | closed |
 | wider output chunk `chunk_d=256` (half the V^T DMA instructions, wider PV GEMM) | the single-tile schedule rejects it at compile time (Z3 `shared` capacity 89600 < 98688); with the two-tile schedule it compiles but the launch fails (`rtsLaunchKernelWithHostArgs`, invalid argument -- the dynamic UBUF/geometry exceeds what the runtime accepts). `chunk_d=128` stays | closed |
 | single 64 KiB transposed V^T tile per KV tile (one large DMA instead of `NUM_DC` small ones) | wrong results (rel 0.88): the L1 NZ tile cannot be sliced per `chunk_d` the way separate per-chunk tiles can; also no faster (1.547 vs 1.557 ms at B=64/kv=8192) | closed |
 | packed length-proportional split plan (A1): per-sequence `ns_batch` + a plan tensor so each block gets an even tile range | **v1 (plan tensor in the address math)**: correct results but 10-26x slower (batch=64/kv=8192: 39.4 vs 1.49 ms) -- every unused slot still loads Q (144 KB) and publishes a 256 KB fp32 partial, and the plan-derived loop bounds defeat the scheduler. **v2 (per-sequence counts + `if loop_range > 0` around the tile body)**: 9x faster than v1 but still 3.2x slower than paged (4.4 vs 1.49 ms) and **wrong** for batch<=8 (rel 0.67-2.33); the backend's ThreadSync pass itself warns "Hoisting sync out of an if ... the race remains". Blocked: there is no safe way to skip a block's tile body on this compiler | closed |

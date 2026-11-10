@@ -146,6 +146,8 @@ def mla_decode_paged_fwd(
     partial_dtype="float32",
     vector_mode="simd_rc",
     stage_cols=None,
+    tile_slots=2,  # accepted and ignored: the single-tile schedule has one slot
+    v_slots=1,     # accepted and ignored: V is loaded inside the tile loop here
 ):
     """Phase 1: per-split partial output + log-sum-exp over a paged KV cache.
 
@@ -464,6 +466,8 @@ def mla_decode_paged_fwd_dual(
     partial_dtype="float32",
     vector_mode="simd_rc",
     stage_cols=None,
+    tile_slots=2,
+    v_slots=1,
 ):
     """Phase 1: per-split partial output + log-sum-exp over a paged KV cache.
 
@@ -556,7 +560,7 @@ def mla_decode_paged_fwd_dual(
             # so slot 1's QK can run while slot 0's softmax is on the vector
             # units; the single score tile in UB is reused, which keeps the
             # dynamic UBUF budget unchanged.
-            TILE_SLOTS = 2
+            TILE_SLOTS = tile_slots
             q_l1 = T.alloc_l1((block_H, dim), dtype)
             q_pe_l1 = T.alloc_l1((block_H, pe_dim), dtype)
             k_l1 = [
@@ -571,9 +575,13 @@ def mla_decode_paged_fwd_dual(
                 [T.alloc_l1((block_H, PAGE_ROWS), dtype) for _ in range(NUM_PC)]
                 for _ in range(TILE_SLOTS)
             ]
+            # v_slots=2 gives each KV tile its own transposed V tile, so the V
+            # load can be issued in the load phase together with K/K_pe instead of
+            # being serialised behind the previous tile's PV GEMM (FIA keeps MTE2
+            # ~78% busy; the single v tile was the main reason we did not).
             v_l1 = [
                 [T.alloc_l1((chunk_d, PAGE_ROWS), dtype) for _ in range(NUM_DC)]
-                for _ in range(NUM_PC)
+                for _ in range(v_slots if v_slots > 1 else NUM_PC)
             ]
 
             # ------------------------------ L0C -----------------------------
@@ -641,6 +649,16 @@ def mla_decode_paged_fwd_dual(
 
                         T.copy(KV[kv_start:kv_start + PAGE_ROWS, 0:dim], k_l1[ti][pc])
                         T.copy(K_pe[kv_start:kv_start + PAGE_ROWS, 0:pe_dim], k_pe_l1[ti][pc])
+                        if v_slots > 1:
+                            for _i, _vb in enumerate(v_l1[ti]):
+                                T.copy(
+                                    KV[
+                                        kv_start:kv_start + PAGE_ROWS,
+                                        _i * chunk_d:(_i + 1) * chunk_d,
+                                    ],
+                                    _vb,
+                                    transpose=True,
+                                )
 
                 # QK for both slots: the slot-1 GEMMs are issued before slot-0's
                 # softmax so the cube keeps working while the vector units run it.
@@ -741,7 +759,7 @@ def mla_decode_paged_fwd_dual(
                         p_pos = pos + pc * PAGE_ROWS
                         page = block_table[b, T.min(p_pos // block_size, max_pages - 1)]
                         kv_start = page * block_size + p_pos % block_size
-                        for i, vb in enumerate(v_l1[pc]):
+                        for i, vb in enumerate(v_l1[pc] if v_slots == 1 else []):
                             T.copy(
                                 KV[
                                     kv_start:kv_start + PAGE_ROWS,
@@ -752,8 +770,8 @@ def mla_decode_paged_fwd_dual(
                             )
                     for i, _junk in enumerate(o_ub):
                         for pc, pb in enumerate(p_ub):
-                            T.gemm(p_l1[ti][pc], v_l1[pc][i], o_l0c, transpose_B=True,
-                                   clear_accum=(pc == 0))
+                            T.gemm(p_l1[ti][pc], v_l1[ti if v_slots > 1 else pc][i],
+                                   o_l0c, transpose_B=True, clear_accum=(pc == 0))
                         T.dual_copy(o_l0c, o_tmp_ub[0:ROWS, 0:chunk_d])
                         if simd_rc:
                             with T.SimdVF():
@@ -1102,6 +1120,9 @@ def compile_mla_decode_paged(
     ml_width=ML_WIDTH_PAGED,
     merge_vector_mode="simd",
     stage_cols=None,
+    tile_slots=2,
+    block_H=128,
+    v_slots=1,
 ):
     """Compile phase 1 + the shared merge kernel, return one callable.
 
@@ -1141,7 +1162,7 @@ def compile_mla_decode_paged(
             pe_dim=pe_dim,
             block_size=block_size,
             max_pages=max_pages,
-            block_H=128,
+            block_H=block_H,
             block_N=block_N,
             chunk_d=chunk_d,
             softmax_scale=softmax_scale,
@@ -1154,6 +1175,8 @@ def compile_mla_decode_paged(
             partial_dtype=partial_dtype,
             vector_mode=vector_mode,
             stage_cols=stage_cols,
+            tile_slots=tile_slots,
+            v_slots=v_slots,
         ),
         out_idx=[6, 7],
     )
@@ -1164,7 +1187,7 @@ def compile_mla_decode_paged(
             kv_len=num_split * block_N,  # only a shape hint; ns_explicit is authoritative
             dim=dim,
             pe_dim=pe_dim,
-            block_H=128,
+            block_H=block_H,
             block_N=block_N,
             chunk_d=merge_chunk_d,
             num_split=num_split,

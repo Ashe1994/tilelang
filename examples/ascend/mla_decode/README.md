@@ -38,9 +38,10 @@ bench/prof_paged.py          # single-kernel msprof entry for the paged phase 1
 bench/prof_multi.py          # msprof entry for one kernel of native / paged / persistent
 bench/parse_pipes.py         # summarise msprof captures (pipes, waits, L2, bandwidth, MTE counts)
 VERIFICATION.md              # self-verification report
+HANDOVER.md                  # next-developer guide: environment, runbook, dead ends
 ```
 
-The correctness suite is 26 cases: 5 native and 21 paged. Everything validates
+The correctness suite is 28 cases: 5 native and 23 paged. Everything validates
 against an fp32 torch reference with `rtol=atol=1e-2`, and every case is
 repeatable across calls.
 
